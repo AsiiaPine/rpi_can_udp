@@ -1,0 +1,95 @@
+# =============================================================================
+# install_rpi_can_vpn_bridge.sh — example install configuration
+# =============================================================================
+# Copy this file, edit values, then run:
+#   sudo ./install_rpi_can_vpn_bridge.sh --config /path/to/your.conf
+#
+# This file is sourced by bash (KEY=value, # comments, quotes allowed).
+# Any CLI option you pass to the installer overrides the same setting here.
+#
+# SLCAN: slcand logs "netdevice can0" before renaming to slcan0 — normal. List CAN
+# links with: ip -br link show type can   (ifconfig often omits or mislabels them).
+# To stop USB SLCAN: sudo /usr/local/bin/setup_slcan --remove-all
+# =============================================================================
+
+# --- WireGuard -----------------------------------------------------------
+# Existing profile name under /etc/wireguard/<name>.conf, OR full path to a
+# .conf file to copy into /etc/wireguard/
+WG_CONFIG_INPUT="cm_rpi4_hitl"
+
+# --- CAN hardware selection ----------------------------------------------
+# spi   — MCP2515 on SPI (boot overlay + ip link); USB SLCAN disabled
+# slcan — USB serial CAN (SLCAN) only; no SPI overlay changes
+# auto  — prefer SLCAN if that link is UP, else SPI can interface
+CAN_SOURCE="slcan"
+
+# SocketCAN name for the SPI/MCP2515 interface (usually can0)
+SPI_CAN_IFACE="can0"
+
+# Bitrate for SPI/native CAN (bps), e.g. 1000000 for 1 Mbit/s
+CAN_BITRATE="1000000"
+
+# Preferred SLCAN netdev name for iface picker (first USB adapter is often slcan0)
+SLCAN_IFACE="slcan0"
+
+# --- APT -----------------------------------------------------------------
+# Uncomment to skip `apt full-upgrade` (faster repeat installs)
+# SKIP_UPGRADE="1"
+
+# --- USB SLCAN (setup_slcan) ----------------------------------------------
+# If unset, ENABLE_SLCAN follows CAN_SOURCE (off for spi-only).
+# Uncomment to force on/off regardless of CAN_SOURCE.
+# ENABLE_SLCAN="1"
+
+# Speed code 0..8: 4=125k 5=250k 6=500k 8=1M (see: setup_slcan --help)
+SLCAN_SPEED_CODE="8"
+
+# Serial baud for slcand (often 921600 for USB adapters)
+SLCAN_SERIAL_BAUD="1000000"
+
+# Network interface basename (slcan0, slcan1, …)
+SLCAN_BASENAME="slcan"
+
+# "1" = listen-only SLCAN (silent mode)
+SLCAN_SILENT="0"
+
+# Restrict to specific devices (recommended if you have other USB serial gear).
+# Leave unset or empty to use all /dev/ttyUSB* and /dev/ttyACM*
+# SLCAN_DEVICES="/dev/ttyACM0"
+
+# Watchdog period for SLCAN auto-recovery (systemd time format)
+SLCAN_WATCHDOG_INTERVAL="15s"
+
+# --- CAN ↔ UDP bridge (py_can_udp_bridge.py) ------------------------------
+# MODE: bridge | can2udp | udp2can
+MODE="bridge"
+
+# Where to send CAN frames over UDP (e.g. VPN peer or ground station)
+UDP_REMOTE_HOST="127.0.0.1" # should be x.x.x.255 for broadcast
+UDP_REMOTE_PORT="5000"
+
+# Local UDP port for inbound frames (udp2can / bridge)
+UDP_LISTEN_PORT="5001"
+
+STATS_INTERVAL="2.0"
+
+# "1" to pass --udp-broadcast to the bridge
+UDP_BROADCAST="1"
+
+# =============================================================================
+# Quick presets (copy one block’s ideas into the sections above)
+# =============================================================================
+#
+# SPI-only drone with onboard MCP2515:
+#   CAN_SOURCE="spi"
+#   WG_CONFIG_INPUT="wg0"
+#
+# USB CAN adapter only (no MCP2515):
+#   CAN_SOURCE="slcan"
+#   SLCAN_DEVICES="/dev/ttyACM0"
+#
+# VPN peer at 10.8.0.1 for UDP:
+#   UDP_REMOTE_HOST="10.8.0.1"
+#   UDP_REMOTE_PORT="5000"
+#
+# =============================================================================
