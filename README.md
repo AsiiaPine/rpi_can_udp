@@ -54,6 +54,11 @@ Example installer configuration file.
 cp install_rpi_can_vpn_bridge.conf.example my-install.conf
 sudo ./install_rpi_can_vpn_bridge.sh --config ./my-install.conf
 ```
+> [!NOTE] 
+> Don't forget to change UDP_REMOTE_HOST and ports for your connection.
+
+> [!NOTE] 
+> For broadcast the ip address should be x.x.x.255!
 
 ### `py_can_udp_bridge.py`
 
