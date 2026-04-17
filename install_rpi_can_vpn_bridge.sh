@@ -441,6 +441,10 @@ write_bridge_env() {
   : "${UDP_LISTEN_PORT:=5000}"
   : "${STATS_INTERVAL:=2.0}"
   : "${UDP_BROADCAST:=0}"
+  local udp_broadcast_arg=""
+  if [[ "${UDP_BROADCAST}" == "1" ]]; then
+    udp_broadcast_arg="--udp-broadcast"
+  fi
   cat > "${env_file}" <<EOF
 # py_can_udp_bridge.py — CAN_IFACE is written by rpi-can-pick-iface.sh to:
 #   /run/rpi-can-udp-bridge-can.env
@@ -450,6 +454,7 @@ UDP_REMOTE_PORT=${UDP_REMOTE_PORT}
 UDP_LISTEN_PORT=${UDP_LISTEN_PORT}
 STATS_INTERVAL=${STATS_INTERVAL}
 UDP_BROADCAST=${UDP_BROADCAST}
+UDP_BROADCAST_ARG=${udp_broadcast_arg}
 EOF
   chmod 644 "${env_file}"
 }
@@ -468,7 +473,7 @@ EnvironmentFile=/etc/default/rpi-can-udp-bridge
 EnvironmentFile=-/run/rpi-can-udp-bridge-can.env
 WorkingDirectory=${SCRIPT_DIR}
 ExecStartPre=/usr/local/bin/rpi-can-pick-iface.sh
-ExecStart=/bin/sh -c 'set -eu; EXTRA=""; if [ "\${UDP_BROADCAST:-0}" = "1" ]; then EXTRA="--udp-broadcast"; fi; exec /usr/bin/python3 ${BRIDGE_SCRIPT} --mode "\${MODE}" --can-iface "\${CAN_IFACE}" --udp-remote-host "\${UDP_REMOTE_HOST}" --udp-remote-port "\${UDP_REMOTE_PORT}" --udp-listen-port "\${UDP_LISTEN_PORT}" --stats-interval "\${STATS_INTERVAL}" \${EXTRA}'
+ExecStart=/usr/bin/python3 ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG}
 Restart=always
 RestartSec=2
 User=root
