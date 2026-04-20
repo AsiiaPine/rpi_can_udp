@@ -59,13 +59,15 @@ SLCAN_SILENT="0"
 
 # Watchdog period for SLCAN auto-recovery (systemd time format)
 SLCAN_WATCHDOG_INTERVAL="15s"
+# Bridge watchdog waits this long for SLCAN_IFACE to return before restart attempt
+BRIDGE_WATCHDOG_WAIT_MAX_SEC="120"
 
 # --- CAN ↔ UDP bridge (py_can_udp_bridge.py) ------------------------------
 # MODE: bridge | can2udp | udp2can
 MODE="bridge"
 
 # Where to send CAN frames over UDP (e.g. VPN peer or ground station)
-UDP_REMOTE_HOST="127.0.0.1" # should be x.x.x.255 for broadcast
+UDP_REMOTE_HOST="192.168.1.255" # should be x.x.x.255 for broadcast
 UDP_REMOTE_PORT="5000"
 
 # Local UDP port for inbound frames (udp2can / bridge)

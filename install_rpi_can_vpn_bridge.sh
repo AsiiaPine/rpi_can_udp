@@ -22,6 +22,7 @@ BRIDGE_SCRIPT="${SCRIPT_DIR}/py_can_udp_bridge.py"
 SETUP_SLCAN_SRC="${SCRIPT_DIR}/scripts/setup_slcan"
 SLCAN_ATTACH_SRC="${SCRIPT_DIR}/scripts/rpi-slcan-attach.sh"
 SLCAN_WATCHDOG_SRC="${SCRIPT_DIR}/scripts/rpi-slcan-watchdog.sh"
+BRIDGE_WATCHDOG_SRC="${SCRIPT_DIR}/scripts/rpi-can-udp-bridge-watchdog.sh"
 PICK_IFACE_SRC="${SCRIPT_DIR}/scripts/rpi-can-pick-iface.sh"
 
 WG_CONFIG_INPUT="wg0"
@@ -31,6 +32,7 @@ SLCAN_IFACE="slcan0"
 CAN_BITRATE="1000000"
 SKIP_UPGRADE="0"
 SLCAN_WATCHDOG_INTERVAL="15s"
+BRIDGE_WATCHDOG_WAIT_MAX_SEC="120"
 
 UDEV_RULE_FILE="/etc/udev/rules.d/99-rpi-slcan.rules"
 
@@ -71,6 +73,7 @@ Recognized keys in --config (optional unless noted):
   SLCAN_SILENT      1 for listen-only SLCAN
   SLCAN_DEVICES     Space-separated TTY list, or empty for auto ttyUSB*/ttyACM*
   SLCAN_WATCHDOG_INTERVAL  Timer period to auto-recover SLCAN (default: 15s)
+  BRIDGE_WATCHDOG_WAIT_MAX_SEC Max wait for SLCAN iface before bridge restart (default: 120)
   MODE              Bridge mode: bridge | can2udp | udp2can
   UDP_REMOTE_HOST   Remote UDP host
   UDP_REMOTE_PORT   Remote UDP port
@@ -82,6 +85,7 @@ Configs after install:
   /etc/default/rpi-can-hardware   — CAN_SOURCE, SPI_CAN_IFACE, SLCAN_IFACE, CAN_BITRATE
   /etc/default/rpi-slcan        — ENABLE_SLCAN, SLCAN_SPEED_CODE, SLCAN_DEVICES, ...
   rpi-slcan-watchdog.timer      — periodic SLCAN recovery checks
+  rpi-can-udp-bridge-watchdog.timer — poll SLCAN; restart bridge only if iface was missing then returned
   /etc/default/rpi-can-udp-bridge — UDP bridge settings (CAN_IFACE set at runtime)
 
 Example install config: install_rpi_can_vpn_bridge.conf.example
@@ -111,7 +115,7 @@ require_bridge_script() {
 }
 
 require_bundled_scripts() {
-  if [[ ! -f "${SETUP_SLCAN_SRC}" || ! -f "${SLCAN_ATTACH_SRC}" || ! -f "${SLCAN_WATCHDOG_SRC}" || ! -f "${PICK_IFACE_SRC}" ]]; then
+  if [[ ! -f "${SETUP_SLCAN_SRC}" || ! -f "${SLCAN_ATTACH_SRC}" || ! -f "${SLCAN_WATCHDOG_SRC}" || ! -f "${BRIDGE_WATCHDOG_SRC}" || ! -f "${PICK_IFACE_SRC}" ]]; then
     err "Missing bundled scripts under ${SCRIPT_DIR}/scripts/"
     exit 1
   fi
@@ -316,6 +320,7 @@ write_slcan_defaults() {
   : "${SLCAN_SILENT:=0}"
   : "${SLCAN_DEVICES:=}"
   : "${SLCAN_WATCHDOG_INTERVAL:=15s}"
+  : "${BRIDGE_WATCHDOG_WAIT_MAX_SEC:=120}"
   {
     cat <<EOF
 # Set to 0 to disable USB SLCAN attach (see setup_slcan gist)
@@ -327,6 +332,7 @@ SLCAN_BASENAME=${SLCAN_BASENAME}
 SLCAN_SILENT=${SLCAN_SILENT}
 # Space-separated TTY list, or empty for all /dev/ttyUSB* /dev/ttyACM*
 SLCAN_WATCHDOG_INTERVAL=${SLCAN_WATCHDOG_INTERVAL}
+BRIDGE_WATCHDOG_WAIT_MAX_SEC=${BRIDGE_WATCHDOG_WAIT_MAX_SEC}
 EOF
     printf 'SLCAN_DEVICES=%q\n' "${SLCAN_DEVICES}"
   } > "${f}"
@@ -337,6 +343,7 @@ install_helpers() {
   install -m 755 "${SETUP_SLCAN_SRC}" /usr/local/bin/setup_slcan
   install -m 755 "${SLCAN_ATTACH_SRC}" /usr/local/bin/rpi-slcan-attach.sh
   install -m 755 "${SLCAN_WATCHDOG_SRC}" /usr/local/bin/rpi-slcan-watchdog.sh
+  install -m 755 "${BRIDGE_WATCHDOG_SRC}" /usr/local/bin/rpi-can-udp-bridge-watchdog.sh
   install -m 755 "${PICK_IFACE_SRC}" /usr/local/bin/rpi-can-pick-iface.sh
 }
 
@@ -414,6 +421,36 @@ WantedBy=timers.target
 EOF
 }
 
+write_bridge_watchdog_service() {
+  local svc="/etc/systemd/system/rpi-can-udp-bridge-watchdog.service"
+  cat > "${svc}" <<'EOF'
+[Unit]
+Description=Watchdog for rpi-can-udp-bridge (restart only after SLCAN recovery)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/rpi-can-udp-bridge-watchdog.sh
+EOF
+}
+
+write_bridge_watchdog_timer() {
+  local tmr="/etc/systemd/system/rpi-can-udp-bridge-watchdog.timer"
+  cat > "${tmr}" <<EOF
+[Unit]
+Description=Periodic check for SLCAN loss; conditional bridge restart
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=${SLCAN_WATCHDOG_INTERVAL}
+AccuracySec=2s
+Unit=rpi-can-udp-bridge-watchdog.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 write_slcan_udev_rules() {
   cat > "${UDEV_RULE_FILE}" <<'EOF'
 # Re-run SLCAN attach when a USB serial device appears (ttyUSB / ttyACM).
@@ -469,11 +506,13 @@ Wants=network-online.target wg-quick@${WG_CONFIG_NAME}.service
 
 [Service]
 Type=simple
+# Line-buffer stdout/stderr to journald (otherwise Python may buffer for a long time).
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/default/rpi-can-udp-bridge
 EnvironmentFile=-/run/rpi-can-udp-bridge-can.env
 WorkingDirectory=${SCRIPT_DIR}
 ExecStartPre=/usr/local/bin/rpi-can-pick-iface.sh
-ExecStart=/usr/bin/python3 ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG}
+ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG}
 Restart=always
 RestartSec=2
 User=root
@@ -491,12 +530,14 @@ enable_disable_can_stack() {
   if [[ "${CAN_SOURCE}" == "spi" ]]; then
     systemctl disable rpi-slcan.service 2>/dev/null || true
     systemctl disable rpi-slcan-watchdog.timer 2>/dev/null || true
+    systemctl enable rpi-can-udp-bridge-watchdog.timer
     systemctl stop rpi-slcan-watchdog.timer 2>/dev/null || true
     systemctl stop rpi-slcan.service 2>/dev/null || true
     remove_slcan_udev_rules
   else
     systemctl enable rpi-slcan.service
     systemctl enable rpi-slcan-watchdog.timer
+    systemctl enable rpi-can-udp-bridge-watchdog.timer
     write_slcan_udev_rules
   fi
 
@@ -517,6 +558,7 @@ start_services() {
   systemctl restart rpi-can-spi.service || true
   systemctl restart rpi-slcan.service || true
   systemctl restart rpi-slcan-watchdog.timer || true
+  systemctl restart rpi-can-udp-bridge-watchdog.timer || true
   systemctl restart rpi-can-udp-bridge.service || true
 }
 
@@ -526,6 +568,7 @@ show_status() {
   systemctl --no-pager --full status rpi-can-spi.service || true
   systemctl --no-pager --full status rpi-slcan.service || true
   systemctl --no-pager --full status rpi-slcan-watchdog.timer || true
+  systemctl --no-pager --full status rpi-can-udp-bridge-watchdog.timer || true
   systemctl --no-pager --full status rpi-can-udp-bridge.service || true
 }
 
@@ -551,6 +594,8 @@ main() {
   write_slcan_service
   write_slcan_watchdog_service
   write_slcan_watchdog_timer
+  write_bridge_watchdog_service
+  write_bridge_watchdog_timer
   write_bridge_env
   write_bridge_service
   enable_disable_can_stack
