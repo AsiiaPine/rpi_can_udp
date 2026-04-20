@@ -13,13 +13,13 @@ import errno
 import ipaddress
 import os
 import select
-from typing import Callable
 import signal
 import socket
 import struct
 import sys
 import time
 import zlib
+from typing import Callable
 
 
 CAN_EFF_FLAG = 0x80000000
@@ -52,7 +52,6 @@ def _resolved_ipv4_needs_so_broadcast(host: str) -> bool:
         return False
     if addr == ipaddress.IPv4Address("255.255.255.255"):
         return True
-    # Typical /24 "all hosts" broadcast; heuristic (rare hosts use .255 in other masks).
     return (int(addr) & 0xFF) == 255
 
 
@@ -120,17 +119,22 @@ def parse_args() -> argparse.Namespace:
         "--can-disable-local-loopback",
         action="store_true",
         help="Set CAN_RAW_LOOPBACK=0 on this socket (kernel default is ON). "
-        "Only use if you hit extra RX/UDP starvation on vcan; with loopback off, "
-        "other tools on the same host (e.g. candump) may not see UDP-injected TX "
-        "unless the frame is echoed from the real bus (ACK).",
+        "Use on vcan or to reduce echo traffic; candump on the same host may miss local TX.",
     )
     p.add_argument(
         "--drain-burst",
         type=int,
         default=64,
         metavar="N",
-        help="Max CAN (or UDP) frames per inner drain step before serving the other direction; "
-        "prevents one side from starving the other in bridge mode.",
+        help="Max UDP frames per inner drain step in bridge mode; CAN side uses N * bridge-can-weight.",
+    )
+    p.add_argument(
+        "--bridge-can-weight",
+        type=int,
+        default=2,
+        metavar="K",
+        help="In bridge mode, read up to (drain-burst * K) CAN frames per leg before a UDP leg "
+        "(K>=1). Higher K favors CAN->UDP and reduces tail drops under duplex load.",
     )
     return p.parse_args()
 
@@ -194,10 +198,6 @@ def can_send_with_backpressure(
     should_stop: Callable[[], bool],
     max_wait_sec: float,
 ) -> bool:
-    """
-    Non-blocking CAN sockets return EAGAIN when the TX queue is full.
-    Wait until the socket is writable, then retry (do not drop the frame).
-    """
     deadline = time.monotonic() + max(max_wait_sec, 0.01)
     while not should_stop():
         try:
@@ -311,10 +311,12 @@ def main() -> int:
             udp_rx.close()
             return 2
 
+    can_w = max(1, args.bridge_can_weight)
     print(
         f"[INFO] Started mode={args.mode} can={args.can_iface} "
         f"udp_remote={remote[0]}:{remote[1]} udp_listen={args.udp_listen_port} "
-        f"udp_broadcast={udp_broadcast_tx} select_timeout={args.select_timeout}s"
+        f"udp_broadcast={udp_broadcast_tx} bridge_can_weight={can_w} "
+        f"drain_burst={args.drain_burst} select_timeout={args.select_timeout}s"
     )
 
     seq = 0
@@ -325,6 +327,9 @@ def main() -> int:
     dropped_bad_crc = 0
     dropped_can_wrong_len = 0
     last_stats = time.monotonic()
+
+    burst = max(1, args.drain_burst)
+    can_leg = burst * can_w
 
     while not stop:
         read_list = []
@@ -337,19 +342,14 @@ def main() -> int:
             time.sleep(0.05)
             continue
 
-        # Avoid select(0) busy-loop when idle.
         sel_to = args.select_timeout if args.select_timeout > 0 else 0.05
         select.select(read_list, [], [], sel_to)
 
-        burst = max(1, args.drain_burst)
-
-        # Alternate bounded bursts between CAN and UDP so bridge mode does not
-        # starve UDP recv while draining a long CAN backlog (kernel UDP drops).
         if args.mode == "bridge":
             while not stop:
                 can_progress = 0
                 udp_progress = 0
-                for _ in range(burst):
+                for _ in range(can_leg):
                     try:
                         frame = can_sock.recv(CAN_FRAME_STRUCT.size)
                     except BlockingIOError:
