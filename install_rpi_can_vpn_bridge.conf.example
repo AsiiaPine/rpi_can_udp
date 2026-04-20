@@ -78,6 +78,10 @@ STATS_INTERVAL="2.0"
 # "1" to pass --udp-broadcast to the bridge
 UDP_BROADCAST="1"
 
+UDP_PENDING_MAX="65536"
+
+BRIDGE_ORDER="udp_first"
+
 # =============================================================================
 # Quick presets (copy one block’s ideas into the sections above)
 # =============================================================================

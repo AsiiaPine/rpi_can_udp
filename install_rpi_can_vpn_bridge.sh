@@ -80,6 +80,8 @@ Recognized keys in --config (optional unless noted):
   UDP_LISTEN_PORT   Local UDP listen port
   STATS_INTERVAL    Stats print interval (seconds)
   UDP_BROADCAST     1 to enable --udp-broadcast
+  UDP_PENDING_MAX   Max queued CAN->UDP datagrams if UDP send would block (default: 65536)
+  BRIDGE_ORDER      Bridge inner loop: can_first (default, sniffer-friendly on RPi) runs CAN->UDP then UDP->CAN each round; udp_first injects from UDP before draining CAN — use on the PC tunnel side to avoid multi-frame reordering when the local CAN bus is busy.
 
 Configs after install:
   /etc/default/rpi-can-hardware   — CAN_SOURCE, SPI_CAN_IFACE, SLCAN_IFACE, CAN_BITRATE
@@ -478,6 +480,8 @@ write_bridge_env() {
   : "${UDP_LISTEN_PORT:=5000}"
   : "${STATS_INTERVAL:=2.0}"
   : "${UDP_BROADCAST:=0}"
+  : "${UDP_PENDING_MAX:=65536}"
+  : "${BRIDGE_ORDER:=can_first}"
   local udp_broadcast_arg=""
   if [[ "${UDP_BROADCAST}" == "1" ]]; then
     udp_broadcast_arg="--udp-broadcast"
@@ -491,6 +495,8 @@ UDP_REMOTE_PORT=${UDP_REMOTE_PORT}
 UDP_LISTEN_PORT=${UDP_LISTEN_PORT}
 STATS_INTERVAL=${STATS_INTERVAL}
 UDP_BROADCAST=${UDP_BROADCAST}
+UDP_PENDING_MAX=${UDP_PENDING_MAX}
+BRIDGE_ORDER=${BRIDGE_ORDER}
 UDP_BROADCAST_ARG=${udp_broadcast_arg}
 EOF
   chmod 644 "${env_file}"
@@ -512,7 +518,7 @@ EnvironmentFile=/etc/default/rpi-can-udp-bridge
 EnvironmentFile=-/run/rpi-can-udp-bridge-can.env
 WorkingDirectory=${SCRIPT_DIR}
 ExecStartPre=/usr/local/bin/rpi-can-pick-iface.sh
-ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG}
+ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG} --bridge-order \${BRIDGE_ORDER} --udp-pending-max \${UDP_PENDING_MAX}
 Restart=always
 RestartSec=2
 User=root
