@@ -20,7 +20,6 @@ import struct
 import sys
 import time
 import zlib
-from typing import Callable
 
 
 CAN_EFF_FLAG = 0x80000000
@@ -63,6 +62,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--udp-remote-host", default="127.0.0.1", help="Remote UDP host")
     p.add_argument("--udp-remote-port", type=int, default=5000, help="Remote UDP port")
     p.add_argument(
+        "--udp-auto-peers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-register UDP peers from inbound datagrams and fan out CAN->UDP to all active peers "
+        "(default: on). Use --no-udp-auto-peers for single remote peer mode.",
+    )
+    p.add_argument(
+        "--udp-peer-ttl-sec",
+        type=float,
+        default=30.0,
+        metavar="SEC",
+        help="Peer TTL for auto-registered UDP peers (default: 30). Inactive peers are evicted.",
+    )
+    p.add_argument(
+        "--udp-max-peers",
+        type=int,
+        default=64,
+        metavar="N",
+        help="Max number of active UDP peers in auto-peer mode (default: 64).",
+    )
+    p.add_argument(
         "--udp-broadcast",
         action="store_true",
         help="Force SO_BROADCAST on the UDP TX socket. Also set automatically when "
@@ -94,13 +114,6 @@ def parse_args() -> argparse.Namespace:
         default=1 << 20,
         metavar="BYTES",
         help="SO_SNDBUF for CAN socket (best-effort; reduces EAGAIN on UDP->CAN bursts)",
-    )
-    p.add_argument(
-        "--can-send-wait",
-        type=float,
-        default=2.0,
-        metavar="SEC",
-        help="Max total time to wait for CAN TX queue (UDP->CAN) before counting a hard failure",
     )
     p.add_argument(
         "--udp-rx-buf",
@@ -139,11 +152,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--bridge-order",
-        choices=["can_first", "udp_first"],
+        choices=["can_first", "udp_first", "interleaved"],
         default="can_first",
-        help="Bridge inner loop: can_first (default, sniffer-friendly on RPi) runs CAN->UDP then "
-        "UDP->CAN each round; udp_first injects from UDP before draining CAN — use on the PC "
-        "tunnel side to avoid multi-frame reordering when the local CAN bus is busy.",
+        help="Bridge inner loop: can_first (RPi / sniff-heavy) drains CAN->UDP then UDP->CAN; "
+        "udp_first drains UDP->CAN first (good when PC only listens, bad if the same iface also "
+        "hosts an active DroneCAN node — local TX waits behind up to drain-burst remote frames); "
+        "interleaved alternates one UDP frame and one CAN frame up to drain-burst cycles (safest "
+        "when one host both injects and tunnels).",
     )
     p.add_argument(
         "--udp-pending-max",
@@ -152,6 +167,20 @@ def parse_args() -> argparse.Namespace:
         metavar="N",
         help="Max queued CAN->UDP datagrams if UDP send would block (non-blocking TX); "
         "avoids CAN RX overflow on bursts. Very full queue logs once.",
+    )
+    p.add_argument(
+        "--can-pending-max",
+        type=int,
+        default=65536,
+        metavar="N",
+        help="Max queued UDP->CAN frames if CAN send would block (e.g. slcan/USB serial); "
+        "avoids stalling UDP recv and gaps in multi-frame transfers. Default matches udp-pending-max.",
+    )
+    p.add_argument(
+        "--udp-drop-out-of-order",
+        action="store_true",
+        help="Drop late/out-of-order UDP frames on UDP->CAN path using per-packet seq number. "
+        "Can reduce corrupted multi-frame transfers on jittery links at cost of possible frame drops.",
     )
     return p.parse_args()
 
@@ -179,15 +208,15 @@ def build_udp_frame(can_id_raw: int, dlc: int, data8: bytes, seq: int) -> bytes:
     )
 
 
-def parse_udp_frame(payload: bytes) -> tuple[bool, int, int, bytes]:
+def parse_udp_frame(payload: bytes) -> tuple[bool, int, int, bytes, int]:
     if len(payload) != UDP_FRAME_STRUCT.size:
-        return False, 0, 0, b""
-    magic, version, flags, can_id, dlc, data8, _seq, crc = UDP_FRAME_STRUCT.unpack(payload)
+        return False, 0, 0, b"", 0
+    magic, version, flags, can_id, dlc, data8, seq, crc = UDP_FRAME_STRUCT.unpack(payload)
     if magic != UDP_MAGIC or version != UDP_VERSION or dlc > 8:
-        return False, 0, 0, b""
+        return False, 0, 0, b"", 0
     calc_crc = zlib.crc32(payload[:-4]) & 0xFFFFFFFF
     if calc_crc != crc:
-        return False, 0, 0, b""
+        return False, 0, 0, b"", 0
 
     can_id_raw = (can_id & CAN_EFF_MASK) if (flags & FLAG_EXTENDED) else (can_id & CAN_SFF_MASK)
     if flags & FLAG_EXTENDED:
@@ -197,7 +226,7 @@ def parse_udp_frame(payload: bytes) -> tuple[bool, int, int, bytes]:
     if flags & FLAG_ERROR:
         can_id_raw |= CAN_ERR_FLAG
 
-    return True, can_id_raw, dlc, data8
+    return True, can_id_raw, dlc, data8, seq
 
 
 def _send_would_block(exc: BaseException) -> bool:
@@ -208,31 +237,12 @@ def _send_would_block(exc: BaseException) -> bool:
     return False
 
 
-def can_send_with_backpressure(
-    can_sock: socket.socket,
-    can_frame: bytes,
-    *,
-    should_stop: Callable[[], bool],
-    max_wait_sec: float,
-) -> bool:
-    deadline = time.monotonic() + max(max_wait_sec, 0.01)
-    while not should_stop():
-        try:
-            can_sock.send(can_frame)
-            return True
-        except (BlockingIOError, OSError) as exc:
-            if not _send_would_block(exc):
-                print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
-                return False
-        if time.monotonic() >= deadline:
-            print("[ERR] CAN send: TX queue stayed full (timeout)", file=sys.stderr)
-            return False
-        remaining = deadline - time.monotonic()
-        try:
-            select.select([], [can_sock], [], max(0.0, min(0.25, remaining)))
-        except InterruptedError:
-            continue
-    return False
+def _is_seq_ahead(expected: int, got: int) -> bool:
+    """
+    Compare uint32 sequence numbers with wrap-around semantics.
+    Returns True when got is ahead of expected in modular space.
+    """
+    return ((got - expected) & 0xFFFFFFFF) < 0x80000000
 
 
 def main() -> int:
@@ -307,6 +317,48 @@ def main() -> int:
             return 1
 
     remote = (args.udp_remote_host, args.udp_remote_port)
+    peers_last_seen: dict[tuple[str, int], float] = {remote: time.monotonic()}
+    peer_ttl = max(1.0, args.udp_peer_ttl_sec)
+    peer_max = max(1, args.udp_max_peers)
+
+    def _touch_peer(peer: tuple[str, int], *, now: float | None = None) -> None:
+        if not args.udp_auto_peers:
+            return
+        ts = time.monotonic() if now is None else now
+        if peer in peers_last_seen:
+            peers_last_seen[peer] = ts
+            return
+        if len(peers_last_seen) >= peer_max:
+            # Evict oldest peer to keep registration zero-config.
+            oldest = min(peers_last_seen.items(), key=lambda kv: kv[1])[0]
+            oldest_idle = ts - peers_last_seen[oldest]
+            peers_last_seen.pop(oldest, None)
+            print(
+                f"[PEER] evicted oldest {oldest[0]}:{oldest[1]} idle={oldest_idle:.1f}s "
+                f"(max_peers={peer_max})",
+                file=sys.stderr,
+            )
+        peers_last_seen[peer] = ts
+        print(
+            f"[PEER] connected {peer[0]}:{peer[1]} active_peers={len(peers_last_seen)}",
+            file=sys.stderr,
+        )
+
+    def _gc_peers(*, now: float | None = None) -> None:
+        if not args.udp_auto_peers:
+            return
+        ts = time.monotonic() if now is None else now
+        stale = [(p, ts - last) for p, last in peers_last_seen.items() if (ts - last) > peer_ttl]
+        for p, idle in stale:
+            peers_last_seen.pop(p, None)
+            udp_seq_expected_by_peer.pop(p, None)
+            print(
+                f"[PEER] disconnected {p[0]}:{p[1]} idle={idle:.1f}s "
+                f"(ttl={peer_ttl:.1f}s) active_peers={len(peers_last_seen)}",
+                file=sys.stderr,
+            )
+        if not peers_last_seen:
+            peers_last_seen[remote] = ts
     if args.mode == "bridge" and not args.allow_self_loop and not udp_broadcast_tx:
         local_hosts = {"127.0.0.1", "localhost", "0.0.0.0"}
         try:
@@ -333,9 +385,12 @@ def main() -> int:
     print(
         f"[INFO] Started mode={args.mode} can={args.can_iface} "
         f"udp_remote={remote[0]}:{remote[1]} udp_listen={args.udp_listen_port} "
+        f"udp_auto_peers={args.udp_auto_peers} udp_peer_ttl_sec={peer_ttl} udp_max_peers={peer_max} "
         f"udp_broadcast={udp_broadcast_tx} bridge_can_weight={can_w} "
         f"bridge_order={args.bridge_order} drain_burst={args.drain_burst} "
-        f"udp_pending_max={args.udp_pending_max} select_timeout={args.select_timeout}s"
+        f"udp_pending_max={args.udp_pending_max} can_pending_max={args.can_pending_max} "
+        f"udp_drop_out_of_order={args.udp_drop_out_of_order} "
+        f"select_timeout={args.select_timeout}s"
     )
 
     seq = 0
@@ -345,18 +400,27 @@ def main() -> int:
     can_tx_fail = 0
     dropped_bad_crc = 0
     dropped_can_wrong_len = 0
+    udp_seq_gap_frames = 0
+    udp_seq_out_of_order = 0
+    udp_seq_expected_by_peer: dict[tuple[str, int], int] = {}
+    udp_seq_dropped_ooo = 0
     udp_pending_peak = 0
     udp_pending_full = 0  # times CAN->UDP stopped reading CAN because pending queue was full
     last_stats = time.monotonic()
 
-    pending_udp: deque[bytes] = deque()
+    pending_udp: deque[tuple[bytes, tuple[str, int]]] = deque()
     udp_pending_max = max(32, args.udp_pending_max)
+    pending_can: deque[bytes] = deque()
+    can_pending_max = max(32, args.can_pending_max)
+    can_pending_peak = 0
+    can_pending_full = 0
 
     def flush_udp_pending() -> None:
         nonlocal tx_can2udp, udp_pending_peak
         while pending_udp:
             try:
-                udp_tx.sendto(pending_udp[0], remote)
+                payload0, peer0 = pending_udp[0]
+                udp_tx.sendto(payload0, peer0)
                 pending_udp.popleft()
                 tx_can2udp += 1
             except (BlockingIOError, OSError) as exc:
@@ -366,6 +430,21 @@ def main() -> int:
                 pending_udp.popleft()
                 break
         udp_pending_peak = max(udp_pending_peak, len(pending_udp))
+
+    def flush_can_pending() -> None:
+        nonlocal rx_udp2can, can_pending_peak
+        while pending_can:
+            try:
+                can_sock.send(pending_can[0])
+                pending_can.popleft()
+                rx_udp2can += 1
+            except (BlockingIOError, OSError) as exc:
+                if _send_would_block(exc):
+                    break
+                print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                pending_can.popleft()
+                break
+        can_pending_peak = max(can_pending_peak, len(pending_can))
 
     burst = max(1, args.drain_burst)
     can_leg = burst * can_w
@@ -382,23 +461,114 @@ def main() -> int:
             continue
 
         sel_to = args.select_timeout if args.select_timeout > 0 else 0.05
-        write_list = [udp_tx] if pending_udp else []
+        write_list = []
+        if pending_udp:
+            write_list.append(udp_tx)
+        if pending_can:
+            write_list.append(can_sock)
         try:
             select.select(read_list, write_list, [], sel_to)
         except InterruptedError:
             continue
 
         flush_udp_pending()
+        flush_can_pending()
+        _gc_peers()
 
         if args.mode in ("can2udp", "bridge") and len(pending_udp) >= udp_pending_max:
             udp_pending_full += 1
+        if args.mode in ("udp2can", "bridge") and len(pending_can) >= can_pending_max:
+            can_pending_full += 1
 
         if args.mode == "bridge":
-            udp_first = args.bridge_order == "udp_first"
             while not stop:
                 flush_udp_pending()
+                flush_can_pending()
                 can_progress = 0
                 udp_progress = 0
+
+                def try_one_udp_to_can() -> bool:
+                    nonlocal udp_progress, udp_rx_frames, rx_udp2can, can_tx_fail, dropped_bad_crc, can_pending_peak
+                    nonlocal udp_seq_gap_frames, udp_seq_out_of_order, udp_seq_dropped_ooo
+                    if len(pending_can) >= can_pending_max:
+                        return False
+                    try:
+                        payload, src = udp_rx.recvfrom(65535)
+                    except BlockingIOError:
+                        return False
+                    except OSError as exc:
+                        print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
+                        return False
+                    udp_rx_frames += 1
+                    ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
+                    if not ok:
+                        dropped_bad_crc += 1
+                        return True
+                    peer = (src[0], int(src[1]))
+                    _touch_peer(peer)
+                    expected = udp_seq_expected_by_peer.get(peer)
+                    if expected is None:
+                        udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                    elif seq_rx != expected:
+                        if _is_seq_ahead(expected, seq_rx):
+                            udp_seq_gap_frames += (seq_rx - expected) & 0xFFFFFFFF
+                            udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                        else:
+                            udp_seq_out_of_order += 1
+                            if args.udp_drop_out_of_order:
+                                udp_seq_dropped_ooo += 1
+                                return True
+                    else:
+                        udp_seq_expected_by_peer[peer] = (expected + 1) & 0xFFFFFFFF
+                    can_frame = CAN_FRAME_STRUCT.pack(can_id_raw, dlc, data8)
+                    try:
+                        can_sock.send(can_frame)
+                        rx_udp2can += 1
+                        udp_progress += 1
+                    except (BlockingIOError, OSError) as exc:
+                        if _send_would_block(exc):
+                            pending_can.append(can_frame)
+                            udp_progress += 1
+                            can_pending_peak = max(can_pending_peak, len(pending_can))
+                        else:
+                            print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                            can_tx_fail += 1
+                    return True
+
+                def try_one_can_to_udp() -> bool:
+                    nonlocal can_progress, seq, tx_can2udp, udp_pending_peak, dropped_can_wrong_len
+                    if len(pending_udp) >= udp_pending_max:
+                        return False
+                    try:
+                        frame = can_sock.recv(CAN_FRAME_STRUCT.size)
+                    except BlockingIOError:
+                        return False
+                    except OSError as exc:
+                        print(f"[ERR] CAN recv failed: {exc}", file=sys.stderr)
+                        return False
+                    if len(frame) != CAN_FRAME_STRUCT.size:
+                        dropped_can_wrong_len += 1
+                        return True
+                    can_id_raw, dlc, data8 = CAN_FRAME_STRUCT.unpack(frame)
+                    payload = build_udp_frame(can_id_raw, dlc, data8, seq)
+                    seq += 1
+                    now_send = time.monotonic()
+                    _gc_peers(now=now_send)
+                    targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
+                    if not targets:
+                        targets = [remote]
+                    for peer in targets:
+                        try:
+                            udp_tx.sendto(payload, peer)
+                            tx_can2udp += 1
+                        except (BlockingIOError, OSError) as exc:
+                            if _send_would_block(exc):
+                                pending_udp.append((payload, peer))
+                                udp_pending_peak = max(udp_pending_peak, len(pending_udp))
+                                continue
+                            print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
+                    can_progress += 1
+                    return True
 
                 def bridge_leg_can_to_udp() -> None:
                     nonlocal can_progress, seq, tx_can2udp, udp_pending_peak, dropped_can_wrong_len
@@ -418,46 +588,78 @@ def main() -> int:
                         can_id_raw, dlc, data8 = CAN_FRAME_STRUCT.unpack(frame)
                         payload = build_udp_frame(can_id_raw, dlc, data8, seq)
                         seq += 1
-                        try:
-                            udp_tx.sendto(payload, remote)
-                            tx_can2udp += 1
-                            can_progress += 1
-                        except (BlockingIOError, OSError) as exc:
-                            if _send_would_block(exc):
-                                pending_udp.append(payload)
-                                can_progress += 1
-                                udp_pending_peak = max(udp_pending_peak, len(pending_udp))
-                                break
-                            print(f"[ERR] UDP send failed: {exc}", file=sys.stderr)
+                        now_send = time.monotonic()
+                        _gc_peers(now=now_send)
+                        targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
+                        if not targets:
+                            targets = [remote]
+                        for peer in targets:
+                            try:
+                                udp_tx.sendto(payload, peer)
+                                tx_can2udp += 1
+                            except (BlockingIOError, OSError) as exc:
+                                if _send_would_block(exc):
+                                    pending_udp.append((payload, peer))
+                                    udp_pending_peak = max(udp_pending_peak, len(pending_udp))
+                                    continue
+                                print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
+                        can_progress += 1
 
                 def bridge_leg_udp_to_can() -> None:
-                    nonlocal udp_progress, udp_rx_frames, rx_udp2can, can_tx_fail, dropped_bad_crc
+                    nonlocal udp_progress, udp_rx_frames, rx_udp2can, can_tx_fail, dropped_bad_crc, can_pending_peak
+                    nonlocal udp_seq_gap_frames, udp_seq_out_of_order, udp_seq_dropped_ooo
                     for _ in range(burst):
+                        if len(pending_can) >= can_pending_max:
+                            break
                         try:
-                            payload, _src = udp_rx.recvfrom(65535)
+                            payload, src = udp_rx.recvfrom(65535)
                         except BlockingIOError:
                             break
                         except OSError as exc:
                             print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
                             break
                         udp_rx_frames += 1
-                        ok, can_id_raw, dlc, data8 = parse_udp_frame(payload)
+                        ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
                         if not ok:
                             dropped_bad_crc += 1
                             continue
+                        peer = (src[0], int(src[1]))
+                        _touch_peer(peer)
+                        expected = udp_seq_expected_by_peer.get(peer)
+                        if expected is None:
+                            udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                        elif seq_rx != expected:
+                            if _is_seq_ahead(expected, seq_rx):
+                                udp_seq_gap_frames += (seq_rx - expected) & 0xFFFFFFFF
+                                udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                            else:
+                                udp_seq_out_of_order += 1
+                                if args.udp_drop_out_of_order:
+                                    udp_seq_dropped_ooo += 1
+                                    continue
+                        else:
+                            udp_seq_expected_by_peer[peer] = (expected + 1) & 0xFFFFFFFF
                         can_frame = CAN_FRAME_STRUCT.pack(can_id_raw, dlc, data8)
-                        if can_send_with_backpressure(
-                            can_sock,
-                            can_frame,
-                            should_stop=lambda: stop,
-                            max_wait_sec=args.can_send_wait,
-                        ):
+                        try:
+                            can_sock.send(can_frame)
                             rx_udp2can += 1
                             udp_progress += 1
-                        else:
+                        except (BlockingIOError, OSError) as exc:
+                            if _send_would_block(exc):
+                                pending_can.append(can_frame)
+                                udp_progress += 1
+                                can_pending_peak = max(can_pending_peak, len(pending_can))
+                                break
+                            print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
                             can_tx_fail += 1
 
-                if udp_first:
+                if args.bridge_order == "interleaved":
+                    for _ in range(burst):
+                        u = try_one_udp_to_can()
+                        c = try_one_can_to_udp()
+                        if not u and not c:
+                            break
+                elif args.bridge_order == "udp_first":
                     bridge_leg_udp_to_can()
                     bridge_leg_can_to_udp()
                 else:
@@ -484,39 +686,64 @@ def main() -> int:
                 can_id_raw, dlc, data8 = CAN_FRAME_STRUCT.unpack(frame)
                 payload = build_udp_frame(can_id_raw, dlc, data8, seq)
                 seq += 1
-                try:
-                    udp_tx.sendto(payload, remote)
-                    tx_can2udp += 1
-                except (BlockingIOError, OSError) as exc:
-                    if _send_would_block(exc):
-                        pending_udp.append(payload)
-                        udp_pending_peak = max(udp_pending_peak, len(pending_udp))
-                        break
-                    print(f"[ERR] UDP send failed: {exc}", file=sys.stderr)
+                now_send = time.monotonic()
+                _gc_peers(now=now_send)
+                targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
+                if not targets:
+                    targets = [remote]
+                for peer in targets:
+                    try:
+                        udp_tx.sendto(payload, peer)
+                        tx_can2udp += 1
+                    except (BlockingIOError, OSError) as exc:
+                        if _send_would_block(exc):
+                            pending_udp.append((payload, peer))
+                            udp_pending_peak = max(udp_pending_peak, len(pending_udp))
+                            continue
+                        print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
 
         elif args.mode == "udp2can":
             while True:
+                if len(pending_can) >= can_pending_max:
+                    break
                 try:
-                    payload, _src = udp_rx.recvfrom(65535)
+                    payload, src = udp_rx.recvfrom(65535)
                 except BlockingIOError:
                     break
                 except OSError as exc:
                     print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
                     break
                 udp_rx_frames += 1
-                ok, can_id_raw, dlc, data8 = parse_udp_frame(payload)
+                ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
                 if not ok:
                     dropped_bad_crc += 1
                     continue
-                can_frame = CAN_FRAME_STRUCT.pack(can_id_raw, dlc, data8)
-                if can_send_with_backpressure(
-                    can_sock,
-                    can_frame,
-                    should_stop=lambda: stop,
-                    max_wait_sec=args.can_send_wait,
-                ):
-                    rx_udp2can += 1
+                peer = (src[0], int(src[1]))
+                _touch_peer(peer)
+                expected = udp_seq_expected_by_peer.get(peer)
+                if expected is None:
+                    udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                elif seq_rx != expected:
+                    if _is_seq_ahead(expected, seq_rx):
+                        udp_seq_gap_frames += (seq_rx - expected) & 0xFFFFFFFF
+                        udp_seq_expected_by_peer[peer] = (seq_rx + 1) & 0xFFFFFFFF
+                    else:
+                        udp_seq_out_of_order += 1
+                        if args.udp_drop_out_of_order:
+                            udp_seq_dropped_ooo += 1
+                            continue
                 else:
+                    udp_seq_expected_by_peer[peer] = (expected + 1) & 0xFFFFFFFF
+                can_frame = CAN_FRAME_STRUCT.pack(can_id_raw, dlc, data8)
+                try:
+                    can_sock.send(can_frame)
+                    rx_udp2can += 1
+                except (BlockingIOError, OSError) as exc:
+                    if _send_would_block(exc):
+                        pending_can.append(can_frame)
+                        can_pending_peak = max(can_pending_peak, len(pending_can))
+                        break
+                    print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
                     can_tx_fail += 1
 
         now = time.monotonic()
@@ -526,7 +753,10 @@ def main() -> int:
                 f"rx_udp2can={rx_udp2can} can_tx_fail={can_tx_fail} "
                 f"dropped_bad_crc={dropped_bad_crc} dropped_can_wrong_len={dropped_can_wrong_len} "
                 f"udp_pending={len(pending_udp)} udp_pending_peak={udp_pending_peak} "
-                f"udp_pending_full={udp_pending_full}"
+                f"udp_pending_full={udp_pending_full} can_pending={len(pending_can)} "
+                f"can_pending_peak={can_pending_peak} can_pending_full={can_pending_full} "
+                f"udp_seq_gap_frames={udp_seq_gap_frames} udp_seq_out_of_order={udp_seq_out_of_order} "
+                f"udp_seq_dropped_ooo={udp_seq_dropped_ooo} active_udp_peers={len(peers_last_seen)}"
             )
             last_stats = now
 
