@@ -23,14 +23,8 @@ WG_CONFIG_INPUT="cm_rpi4_hitl"
 # auto  — prefer SLCAN if that link is UP, else SPI can interface
 CAN_SOURCE="slcan"
 
-# SocketCAN name for the SPI/MCP2515 interface (usually can0)
-SPI_CAN_IFACE="can0"
-
 # Bitrate for SPI/native CAN (bps), e.g. 1000000 for 1 Mbit/s
 CAN_BITRATE="1000000"
-
-# Preferred SLCAN netdev name for iface picker (first USB adapter is often slcan0)
-SLCAN_IFACE="slcan0"
 
 # --- APT -----------------------------------------------------------------
 # Uncomment to skip `apt full-upgrade` (faster repeat installs)
@@ -41,14 +35,8 @@ SLCAN_IFACE="slcan0"
 # Uncomment to force on/off regardless of CAN_SOURCE.
 # ENABLE_SLCAN="1"
 
-# Speed code 0..8: 4=125k 5=250k 6=500k 8=1M (see: setup_slcan --help)
-SLCAN_SPEED_CODE="8"
-
-# Serial baud for slcand (often 921600 for USB adapters)
-SLCAN_SERIAL_BAUD="1000000"
-
-# Network interface basename (slcan0, slcan1, …)
-SLCAN_BASENAME="slcan"
+# SLCAN speed code and serial baud are auto-configured from CAN_BITRATE by installer.
+# (Advanced overrides are still possible in /etc/default/rpi-slcan after install.)
 
 # "1" = listen-only SLCAN (silent mode)
 SLCAN_SILENT="0"
@@ -116,8 +104,6 @@ UDP_MAX_PEERS="64"
 # PC running dronecan_fw_update on the SAME can as the bridge: use interleaved (not udp_first).
 BRIDGE_ORDER="can_first"
 DRAIN_BURST="4"
-BRIDGE_CAN_WEIGHT="1"
-SELECT_TIMEOUT="0.001"
 # Set to 1 to drop late/out-of-order UDP frames before injecting into CAN
 UDP_DROP_OUT_OF_ORDER="0"
 

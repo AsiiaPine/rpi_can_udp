@@ -34,6 +34,24 @@ SKIP_UPGRADE="0"
 SLCAN_WATCHDOG_INTERVAL="15s"
 BRIDGE_WATCHDOG_WAIT_MAX_SEC="120"
 
+slcan_speed_code_for_bitrate() {
+  case "$1" in
+    10000) echo 0 ;;
+    20000) echo 1 ;;
+    50000) echo 2 ;;
+    100000) echo 3 ;;
+    125000) echo 4 ;;
+    250000) echo 5 ;;
+    500000) echo 6 ;;
+    750000) echo 7 ;;
+    1000000) echo 8 ;;
+    *)
+      # setup_slcan supports only fixed speed codes; default to 1M for unknown rates.
+      echo 8
+      ;;
+  esac
+}
+
 UDEV_RULE_FILE="/etc/udev/rules.d/99-rpi-slcan.rules"
 
 print_help() {
@@ -63,13 +81,13 @@ Recognized keys in --config (optional unless noted):
   WG_CONFIG_INPUT   WireGuard: name or path to .conf (default: wg0)
   CAN_SOURCE        spi | slcan | auto
   SPI_CAN_IFACE     SPI/native CAN netdev (default: can0)
-  SLCAN_IFACE       Preferred SLCAN netdev for pick-iface (default: slcan0)
+  SLCAN_IFACE       Preferred SLCAN netdev for pick-iface (advanced; default: slcan0)
   CAN_BITRATE       SPI/native bitrate (default: 1000000)
   SKIP_UPGRADE      1 to skip apt full-upgrade
   ENABLE_SLCAN      0/1 for /etc/default/rpi-slcan (default: from CAN_SOURCE)
-  SLCAN_SPEED_CODE  SLCAN speed code 0..8 (default: 8)
-  SLCAN_SERIAL_BAUD Serial baud for slcand (default: 921600)
-  SLCAN_BASENAME    Interface basename (default: slcan)
+  SLCAN_SPEED_CODE  SLCAN speed code 0..8 (advanced; auto-derived from CAN_BITRATE if unset)
+  SLCAN_SERIAL_BAUD Serial baud for slcand (advanced; default: 1000000)
+  SLCAN_BASENAME    Interface basename (advanced; default: slcan)
   SLCAN_SILENT      1 for listen-only SLCAN
   SLCAN_DEVICES     Space-separated TTY list, or empty for auto ttyUSB*/ttyACM*
   SLCAN_WATCHDOG_INTERVAL  Timer period to auto-recover SLCAN (default: 15s)
@@ -87,8 +105,8 @@ Recognized keys in --config (optional unless noted):
   UDP_MAX_PEERS     Max active auto peers (default: 64)
   BRIDGE_ORDER      can_first (RPi default) | udp_first (PC listen-only) | interleaved (PC + active node on same CAN)
   DRAIN_BURST       Frames per bridge leg before switching direction (default: 4 for low latency)
-  BRIDGE_CAN_WEIGHT CAN->UDP leg multiplier in bridge mode (default: 1)
-  SELECT_TIMEOUT    select() timeout seconds when idle (default: 0.001 for low latency)
+  BRIDGE_CAN_WEIGHT CAN->UDP leg multiplier in bridge mode (advanced; default: 1)
+  SELECT_TIMEOUT    select() timeout seconds when idle (advanced; default: 0.001 for low latency)
   UDP_DROP_OUT_OF_ORDER 1 to drop late/out-of-order UDP frames before UDP->CAN inject
 
 Configs after install:
@@ -324,8 +342,8 @@ write_slcan_defaults() {
   else
     enable=1
   fi
-  : "${SLCAN_SPEED_CODE:=8}"
-  : "${SLCAN_SERIAL_BAUD:=921600}"
+  : "${SLCAN_SPEED_CODE:=$(slcan_speed_code_for_bitrate "${CAN_BITRATE}")}"
+  : "${SLCAN_SERIAL_BAUD:=1000000}"
   : "${SLCAN_BASENAME:=slcan}"
   : "${SLCAN_SILENT:=0}"
   : "${SLCAN_DEVICES:=}"
