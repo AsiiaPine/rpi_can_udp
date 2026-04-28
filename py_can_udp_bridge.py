@@ -55,7 +55,7 @@ def _resolved_ipv4_needs_so_broadcast(host: str) -> bool:
     return (int(addr) & 0xFF) == 255
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Python CAN <-> UDP bridge")
     p.add_argument("--mode", choices=["can2udp", "udp2can", "bridge"], default="bridge")
     p.add_argument("--can-iface", default="can0", help="CAN interface name")
@@ -182,7 +182,12 @@ def parse_args() -> argparse.Namespace:
         help="Drop late/out-of-order UDP frames on UDP->CAN path using per-packet seq number. "
         "Can reduce corrupted multi-frame transfers on jittery links at cost of possible frame drops.",
     )
-    return p.parse_args()
+    if argv is None:
+        argv = sys.argv[1:]
+    # systemd EnvironmentFile expansions may occasionally yield empty/whitespace-only args
+    # (e.g. optional flag variables). Drop them to avoid argparse "unrecognized arguments:".
+    clean_argv = [a for a in argv if a and a.strip()]
+    return p.parse_args(clean_argv)
 
 
 def build_udp_frame(can_id_raw: int, dlc: int, data8: bytes, seq: int) -> bytes:
@@ -250,7 +255,7 @@ def main() -> int:
         print("[ERR] This script requires Linux SocketCAN (posix)", file=sys.stderr)
         return 1
 
-    args = parse_args()
+    args = parse_args(sys.argv[1:])
     stop = False
 
     def _sig(_signum, _frame):
@@ -316,8 +321,22 @@ def main() -> int:
             udp_rx.close()
             return 1
 
+    # In bridge mode use the bound RX socket for TX as well, so outbound packets
+    # originate from udp-listen-port (important for peer replies/NAT mapping).
+    udp_send_sock = udp_rx if args.mode == "bridge" else udp_tx
+    if args.udp_tx_buf > 0 and args.mode == "bridge":
+        try:
+            udp_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, args.udp_tx_buf)
+        except OSError as exc:
+            print(f"[ERR] UDP TX buffer (bridge send sock) set failed: {exc}", file=sys.stderr)
+    if udp_broadcast_tx and args.mode == "bridge":
+        try:
+            udp_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError as exc:
+            print(f"[ERR] UDP SO_BROADCAST (bridge send sock) failed: {exc}", file=sys.stderr)
+
     remote = (args.udp_remote_host, args.udp_remote_port)
-    peers_last_seen: dict[tuple[str, int], float] = {remote: time.monotonic()}
+    peers_last_seen: dict[tuple[str, int], float] = {}
     peer_ttl = max(1.0, args.udp_peer_ttl_sec)
     peer_max = max(1, args.udp_max_peers)
 
@@ -357,8 +376,13 @@ def main() -> int:
                 f"(ttl={peer_ttl:.1f}s) active_peers={len(peers_last_seen)}",
                 file=sys.stderr,
             )
-        if not peers_last_seen:
-            peers_last_seen[remote] = ts
+
+    def _build_udp_targets() -> list[tuple[str, int]]:
+        if not args.udp_auto_peers:
+            return [remote]
+        targets = [remote]
+        targets.extend(peer for peer in peers_last_seen.keys() if peer != remote)
+        return targets
     if args.mode == "bridge" and not args.allow_self_loop and not udp_broadcast_tx:
         local_hosts = {"127.0.0.1", "localhost", "0.0.0.0"}
         try:
@@ -420,7 +444,7 @@ def main() -> int:
         while pending_udp:
             try:
                 payload0, peer0 = pending_udp[0]
-                udp_tx.sendto(payload0, peer0)
+                udp_send_sock.sendto(payload0, peer0)
                 pending_udp.popleft()
                 tx_can2udp += 1
             except (BlockingIOError, OSError) as exc:
@@ -463,7 +487,7 @@ def main() -> int:
         sel_to = args.select_timeout if args.select_timeout > 0 else 0.05
         write_list = []
         if pending_udp:
-            write_list.append(udp_tx)
+            write_list.append(udp_send_sock)
         if pending_can:
             write_list.append(can_sock)
         try:
@@ -554,13 +578,11 @@ def main() -> int:
                     seq += 1
                     now_send = time.monotonic()
                     _gc_peers(now=now_send)
-                    targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
-                    if not targets:
-                        targets = [remote]
-                    for peer in targets:
+                    for peer in _build_udp_targets():
                         try:
-                            udp_tx.sendto(payload, peer)
+                            udp_send_sock.sendto(payload, peer)
                             tx_can2udp += 1
+                            _touch_peer(peer, now=now_send)
                         except (BlockingIOError, OSError) as exc:
                             if _send_would_block(exc):
                                 pending_udp.append((payload, peer))
@@ -590,13 +612,11 @@ def main() -> int:
                         seq += 1
                         now_send = time.monotonic()
                         _gc_peers(now=now_send)
-                        targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
-                        if not targets:
-                            targets = [remote]
-                        for peer in targets:
+                        for peer in _build_udp_targets():
                             try:
-                                udp_tx.sendto(payload, peer)
+                                udp_send_sock.sendto(payload, peer)
                                 tx_can2udp += 1
+                                _touch_peer(peer, now=now_send)
                             except (BlockingIOError, OSError) as exc:
                                 if _send_would_block(exc):
                                     pending_udp.append((payload, peer))
@@ -688,13 +708,11 @@ def main() -> int:
                 seq += 1
                 now_send = time.monotonic()
                 _gc_peers(now=now_send)
-                targets = [remote] if not args.udp_auto_peers else list(peers_last_seen.keys())
-                if not targets:
-                    targets = [remote]
-                for peer in targets:
+                for peer in _build_udp_targets():
                     try:
-                        udp_tx.sendto(payload, peer)
+                        udp_send_sock.sendto(payload, peer)
                         tx_can2udp += 1
+                        _touch_peer(peer, now=now_send)
                     except (BlockingIOError, OSError) as exc:
                         if _send_would_block(exc):
                             pending_udp.append((payload, peer))
@@ -762,8 +780,12 @@ def main() -> int:
 
     print("[INFO] Stopping...")
     can_sock.close()
-    udp_tx.close()
-    udp_rx.close()
+    if udp_send_sock is udp_rx:
+        udp_rx.close()
+        udp_tx.close()
+    else:
+        udp_tx.close()
+        udp_rx.close()
     return 0
 
 

@@ -66,8 +66,34 @@ BRIDGE_WATCHDOG_WAIT_MAX_SEC="120"
 # MODE: bridge | can2udp | udp2can
 MODE="bridge"
 
-# Where to send CAN frames over UDP (e.g. VPN peer or ground station)
-UDP_REMOTE_HOST="192.168.1.255" # should be x.x.x.255 for broadcast
+# -----------------------------------------------------------------------------
+# Transport profiles (pick ONE)
+# -----------------------------------------------------------------------------
+# UNICAST 1:1 (strict one remote endpoint):
+#   UDP_REMOTE_HOST="192.168.1.10"
+#   UDP_BROADCAST="0"
+#   UDP_AUTO_PEERS="0"
+#
+# UNICAST multi-client (auto-peers; trusted subnet):
+#   UDP_REMOTE_HOST="192.168.1.10"   # fallback/default remote
+#   UDP_BROADCAST="0"
+#   UDP_AUTO_PEERS="1"
+#   UDP_PEER_TTL_SEC="30"
+#   UDP_MAX_PEERS="64"
+#
+# BROADCAST (easy, but usually more packet loss):
+#   UDP_REMOTE_HOST="192.168.1.255"
+#   UDP_BROADCAST="1"
+#   UDP_AUTO_PEERS="0"
+#
+# MULTICAST (one-to-many readers):
+#   UDP_REMOTE_HOST="239.42.0.1"
+#   UDP_BROADCAST="0"
+#   UDP_AUTO_PEERS="0"
+# -----------------------------------------------------------------------------
+
+# Active transport settings:
+UDP_REMOTE_HOST="10.69.0.1"
 UDP_REMOTE_PORT="5000"
 
 # Local UDP port for inbound frames (udp2can / bridge)
@@ -76,11 +102,24 @@ UDP_LISTEN_PORT="5001"
 STATS_INTERVAL="2.0"
 
 # "1" to pass --udp-broadcast to the bridge
-UDP_BROADCAST="1"
+UDP_BROADCAST="0"
 
 UDP_PENDING_MAX="65536"
+# Max queued UDP->CAN frames when CAN TX blocks (slcan/USB); keep high for firmware transfers
+CAN_PENDING_MAX="65536"
+# Auto-register inbound UDP senders as peers and fan-out CAN->UDP to active peers.
+UDP_AUTO_PEERS="1"
+UDP_PEER_TTL_SEC="30"
+UDP_MAX_PEERS="64"
 
-BRIDGE_ORDER="udp_first"
+# RPi (sniff / forward bus to UDP): can_first. PC with candump only: udp_first.
+# PC running dronecan_fw_update on the SAME can as the bridge: use interleaved (not udp_first).
+BRIDGE_ORDER="can_first"
+DRAIN_BURST="4"
+BRIDGE_CAN_WEIGHT="1"
+SELECT_TIMEOUT="0.001"
+# Set to 1 to drop late/out-of-order UDP frames before injecting into CAN
+UDP_DROP_OUT_OF_ORDER="0"
 
 # =============================================================================
 # Quick presets (copy one block’s ideas into the sections above)

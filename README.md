@@ -84,6 +84,63 @@ Important:
 - UDP payload must match the expected bridge format (`UDP_FRAME_STRUCT`), otherwise frames are dropped (`dropped_bad_crc` grows).
 - For broadcast mode, use your subnet broadcast in `--udp-remote-host` (for example `192.168.1.255`), not `127.0.0.1`.
 
+### Transport Modes
+
+Use one of these transport modes in `/etc/default/rpi-can-udp-bridge` (or in `install_rpi_can_vpn_bridge.conf.example` before install):
+
+- `Unicast 1:1`: strict one remote endpoint.
+- `Unicast Multi-Client`: unicast fan-out with auto-registered peers.
+- `Broadcast`: easiest discovery in one L2 subnet, but usually higher packet loss.
+- `Multicast`: one sender to many listeners via group address (`239.x.x.x`).
+
+Recommended settings by mode:
+
+1) Unicast 1:1:
+
+```bash
+UDP_REMOTE_HOST=192.168.1.10
+UDP_BROADCAST=0
+UDP_AUTO_PEERS=0
+```
+
+2) Unicast Multi-Client (trusted subnet):
+
+```bash
+UDP_REMOTE_HOST=192.168.1.10  # fallback/default peer
+UDP_BROADCAST=0
+UDP_AUTO_PEERS=1
+UDP_PEER_TTL_SEC=30
+UDP_MAX_PEERS=64
+```
+
+3) Broadcast:
+
+```bash
+UDP_REMOTE_HOST=192.168.1.255
+UDP_BROADCAST=1
+UDP_AUTO_PEERS=0
+```
+
+4) Multicast:
+
+```bash
+UDP_REMOTE_HOST=239.42.0.1
+UDP_BROADCAST=0
+UDP_AUTO_PEERS=0
+```
+
+Notes:
+
+- With `UDP_AUTO_PEERS=1`, peers are auto-registered from inbound UDP packets and CAN->UDP is fanned out to active peers (unicast fan-out).
+- In `Multicast`, keep `UDP_AUTO_PEERS=0` because fan-out is performed by multicast group delivery.
+- `UDP_DROP_OUT_OF_ORDER=1` can reduce corrupted multi-frame transfers on jittery links by dropping late UDP packets.
+- After changing `/etc/default/rpi-can-udp-bridge`, run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart rpi-can-udp-bridge.service
+```
+
 ## Scripts in `scripts/`
 
 ### `scripts/setup_slcan`

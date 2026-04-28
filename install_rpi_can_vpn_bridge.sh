@@ -81,7 +81,15 @@ Recognized keys in --config (optional unless noted):
   STATS_INTERVAL    Stats print interval (seconds)
   UDP_BROADCAST     1 to enable --udp-broadcast
   UDP_PENDING_MAX   Max queued CAN->UDP datagrams if UDP send would block (default: 65536)
-  BRIDGE_ORDER      Bridge inner loop: can_first (default, sniffer-friendly on RPi) runs CAN->UDP then UDP->CAN each round; udp_first injects from UDP before draining CAN — use on the PC tunnel side to avoid multi-frame reordering when the local CAN bus is busy.
+  CAN_PENDING_MAX   Max queued UDP->CAN frames if CAN send would block (default: 65536; matters for slcan)
+  UDP_AUTO_PEERS    1 enables auto peer registration from inbound UDP (default: 1)
+  UDP_PEER_TTL_SEC  Auto peer TTL seconds (default: 30)
+  UDP_MAX_PEERS     Max active auto peers (default: 64)
+  BRIDGE_ORDER      can_first (RPi default) | udp_first (PC listen-only) | interleaved (PC + active node on same CAN)
+  DRAIN_BURST       Frames per bridge leg before switching direction (default: 4 for low latency)
+  BRIDGE_CAN_WEIGHT CAN->UDP leg multiplier in bridge mode (default: 1)
+  SELECT_TIMEOUT    select() timeout seconds when idle (default: 0.001 for low latency)
+  UDP_DROP_OUT_OF_ORDER 1 to drop late/out-of-order UDP frames before UDP->CAN inject
 
 Configs after install:
   /etc/default/rpi-can-hardware   — CAN_SOURCE, SPI_CAN_IFACE, SLCAN_IFACE, CAN_BITRATE
@@ -481,10 +489,26 @@ write_bridge_env() {
   : "${STATS_INTERVAL:=2.0}"
   : "${UDP_BROADCAST:=0}"
   : "${UDP_PENDING_MAX:=65536}"
+  : "${CAN_PENDING_MAX:=65536}"
+  : "${UDP_AUTO_PEERS:=1}"
+  : "${UDP_PEER_TTL_SEC:=30}"
+  : "${UDP_MAX_PEERS:=64}"
   : "${BRIDGE_ORDER:=can_first}"
+  : "${DRAIN_BURST:=4}"
+  : "${BRIDGE_CAN_WEIGHT:=1}"
+  : "${SELECT_TIMEOUT:=0.001}"
+  : "${UDP_DROP_OUT_OF_ORDER:=0}"
   local udp_broadcast_arg=""
+  local udp_drop_ooo_arg=""
+  local udp_auto_peers_arg="--udp-auto-peers"
   if [[ "${UDP_BROADCAST}" == "1" ]]; then
     udp_broadcast_arg="--udp-broadcast"
+  fi
+  if [[ "${UDP_DROP_OUT_OF_ORDER}" == "1" ]]; then
+    udp_drop_ooo_arg="--udp-drop-out-of-order"
+  fi
+  if [[ "${UDP_AUTO_PEERS}" == "0" ]]; then
+    udp_auto_peers_arg="--no-udp-auto-peers"
   fi
   cat > "${env_file}" <<EOF
 # py_can_udp_bridge.py — CAN_IFACE is written by rpi-can-pick-iface.sh to:
@@ -496,8 +520,18 @@ UDP_LISTEN_PORT=${UDP_LISTEN_PORT}
 STATS_INTERVAL=${STATS_INTERVAL}
 UDP_BROADCAST=${UDP_BROADCAST}
 UDP_PENDING_MAX=${UDP_PENDING_MAX}
+CAN_PENDING_MAX=${CAN_PENDING_MAX}
+UDP_AUTO_PEERS=${UDP_AUTO_PEERS}
+UDP_PEER_TTL_SEC=${UDP_PEER_TTL_SEC}
+UDP_MAX_PEERS=${UDP_MAX_PEERS}
 BRIDGE_ORDER=${BRIDGE_ORDER}
+DRAIN_BURST=${DRAIN_BURST}
+BRIDGE_CAN_WEIGHT=${BRIDGE_CAN_WEIGHT}
+SELECT_TIMEOUT=${SELECT_TIMEOUT}
+UDP_DROP_OUT_OF_ORDER=${UDP_DROP_OUT_OF_ORDER}
 UDP_BROADCAST_ARG=${udp_broadcast_arg}
+UDP_DROP_OUT_OF_ORDER_ARG=${udp_drop_ooo_arg}
+UDP_AUTO_PEERS_ARG=${udp_auto_peers_arg}
 EOF
   chmod 644 "${env_file}"
 }
@@ -518,7 +552,24 @@ EnvironmentFile=/etc/default/rpi-can-udp-bridge
 EnvironmentFile=-/run/rpi-can-udp-bridge-can.env
 WorkingDirectory=${SCRIPT_DIR}
 ExecStartPre=/usr/local/bin/rpi-can-pick-iface.sh
-ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} --mode \${MODE} --can-iface \${CAN_IFACE} --udp-remote-host \${UDP_REMOTE_HOST} --udp-remote-port \${UDP_REMOTE_PORT} --udp-listen-port \${UDP_LISTEN_PORT} --stats-interval \${STATS_INTERVAL} \${UDP_BROADCAST_ARG} --bridge-order \${BRIDGE_ORDER} --udp-pending-max \${UDP_PENDING_MAX}
+ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} \
+  --mode \${MODE} \
+  --can-iface \${CAN_IFACE} \
+  --udp-remote-host \${UDP_REMOTE_HOST} \
+  --udp-remote-port \${UDP_REMOTE_PORT} \
+  --udp-listen-port \${UDP_LISTEN_PORT} \
+  --stats-interval \${STATS_INTERVAL} \
+  \${UDP_BROADCAST_ARG} \
+  \${UDP_AUTO_PEERS_ARG} \
+  --udp-peer-ttl-sec \${UDP_PEER_TTL_SEC} \
+  --udp-max-peers \${UDP_MAX_PEERS} \
+  --bridge-order \${BRIDGE_ORDER} \
+  --drain-burst \${DRAIN_BURST} \
+  --bridge-can-weight \${BRIDGE_CAN_WEIGHT} \
+  --select-timeout \${SELECT_TIMEOUT} \
+  --udp-pending-max \${UDP_PENDING_MAX} \
+  --can-pending-max \${CAN_PENDING_MAX} \
+  \${UDP_DROP_OUT_OF_ORDER_ARG}
 Restart=always
 RestartSec=2
 User=root
