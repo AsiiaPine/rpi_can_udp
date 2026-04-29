@@ -10,7 +10,7 @@ Compatible with can_udp_bridge.cpp binary UDP frame format:
 
 import argparse
 import errno
-import ipaddress
+import logging
 import os
 from collections import deque
 import select
@@ -38,29 +38,79 @@ CAN_FRAME_STRUCT = struct.Struct("=IB3x8s")   # linux struct can_frame
 UDP_FRAME_STRUCT = struct.Struct("!HBBIB8sII")  # network byte order
 
 
-def _resolved_ipv4_needs_so_broadcast(host: str) -> bool:
-    """
-    Linux requires SO_BROADCAST for sendto() to IPv4 directed broadcast (e.g. 192.168.1.255);
-    otherwise errno is EACCES (Permission denied).
-    """
+LOGGER = logging.getLogger("can_udp_bridge")
+
+
+def _is_ipv4_multicast(host: str) -> bool:
     try:
         ip = socket.gethostbyname(host)
-        addr = ipaddress.ip_address(ip)
-    except (OSError, ValueError):
+    except OSError:
         return False
-    if not isinstance(addr, ipaddress.IPv4Address):
-        return False
-    if addr == ipaddress.IPv4Address("255.255.255.255"):
-        return True
-    return (int(addr) & 0xFF) == 255
+    first_octet = int(ip.split(".", 1)[0])
+    return 224 <= first_octet <= 239
+
+
+def _resolve_iface_ipv4(iface: str) -> str:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise OSError("fcntl is required to resolve interface IPv4 address") from exc
+    ifreq = struct.pack("256s", iface.encode("utf-8")[:15])
+    res = fcntl.ioctl(sock := socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0x8915, ifreq)
+    sock.close()
+    return socket.inet_ntoa(res[20:24])
+
+
+def _multicast_ifaddr(iface: str, ifaddr: str) -> str:
+    if ifaddr:
+        return ifaddr
+    if iface:
+        return _resolve_iface_ipv4(iface)
+    return "0.0.0.0"
+
+
+def _configure_multicast_rx(sock: socket.socket, group_host: str, ifaddr: str) -> None:
+    group_ip = socket.gethostbyname(group_host)
+    membership = socket.inet_aton(group_ip) + socket.inet_aton(ifaddr)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+
+
+def _configure_multicast_tx(sock: socket.socket, ifaddr: str, ttl: int = 1) -> None:
+    if ifaddr != "0.0.0.0":
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(ifaddr))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Python CAN <-> UDP bridge")
     p.add_argument("--mode", choices=["can2udp", "udp2can", "bridge"], default="bridge")
     p.add_argument("--can-iface", default="can0", help="CAN interface name")
+    p.add_argument(
+        "--udp-transport",
+        choices=["unicast", "multicast"],
+        default="unicast",
+        help="UDP transport mode. Unicast supports fixed remote and auto-peers; multicast sends to "
+        "and receives from the multicast group in --udp-remote-host.",
+    )
     p.add_argument("--udp-remote-host", default="127.0.0.1", help="Remote UDP host")
     p.add_argument("--udp-remote-port", type=int, default=5000, help="Remote UDP port")
+    p.add_argument(
+        "--udp-multicast-iface",
+        default="",
+        nargs="?",
+        const="",
+        help="Interface used for IPv4 multicast TX/RX (e.g. wg0). Optional; overrides routing ambiguity.",
+    )
+    p.add_argument(
+        "--udp-multicast-ifaddr",
+        default="",
+        nargs="?",
+        const="",
+        help="Local IPv4 address used for IPv4 multicast TX/RX (e.g. VPN address). "
+        "Takes precedence over --udp-multicast-iface.",
+    )
     p.add_argument(
         "--udp-auto-peers",
         action=argparse.BooleanOptionalAction,
@@ -81,12 +131,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=64,
         metavar="N",
         help="Max number of active UDP peers in auto-peer mode (default: 64).",
-    )
-    p.add_argument(
-        "--udp-broadcast",
-        action="store_true",
-        help="Force SO_BROADCAST on the UDP TX socket. Also set automatically when "
-        "--udp-remote-host resolves to a typical IPv4 broadcast (x.x.x.255 or 255.255.255.255).",
     )
     p.add_argument("--udp-listen-port", type=int, default=5000, help="Local UDP listen port")
     p.add_argument(
@@ -251,11 +295,23 @@ def _is_seq_ahead(expected: int, got: int) -> bool:
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if os.name != "posix":
-        print("[ERR] This script requires Linux SocketCAN (posix)", file=sys.stderr)
+        LOGGER.error("This script requires Linux SocketCAN (posix)")
         return 1
 
     args = parse_args(sys.argv[1:])
+    if args.udp_transport == "multicast" and not _is_ipv4_multicast(args.udp_remote_host):
+        LOGGER.error("Multicast transport requires --udp-remote-host to be an IPv4 multicast group")
+        return 2
+    multicast_ifaddr = "0.0.0.0"
+    if args.udp_transport == "multicast":
+        try:
+            multicast_ifaddr = _multicast_ifaddr(args.udp_multicast_iface, args.udp_multicast_ifaddr)
+        except OSError as exc:
+            LOGGER.error("Multicast interface setup failed: %s", exc)
+            return 2
+        args.udp_auto_peers = False
     stop = False
 
     def _sig(_signum, _frame):
@@ -274,19 +330,19 @@ def main() -> int:
             try:
                 can_sock.setsockopt(socket.SOL_CAN_RAW, _can_raw_lb, 0)
             except OSError as exc:
-                print(f"[WARN] CAN_RAW_LOOPBACK=0 not applied: {exc}", file=sys.stderr)
+                LOGGER.warning("CAN_RAW_LOOPBACK=0 not applied: %s", exc)
         if args.can_rx_buf > 0:
             try:
                 can_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.can_rx_buf)
             except OSError as exc:
-                print(f"[ERR] CAN RX buffer set failed: {exc}", file=sys.stderr)
+                LOGGER.error("CAN RX buffer set failed: %s", exc)
         if args.can_tx_buf > 0:
             try:
                 can_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, args.can_tx_buf)
             except OSError as exc:
-                print(f"[ERR] CAN TX buffer set failed: {exc}", file=sys.stderr)
+                LOGGER.error("CAN TX buffer set failed: %s", exc)
     except OSError as exc:
-        print(f"[ERR] CAN init failed: {exc}", file=sys.stderr)
+        LOGGER.error("CAN init failed: %s", exc)
         return 1
 
     udp_tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -297,25 +353,25 @@ def main() -> int:
         try:
             udp_tx.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, args.udp_tx_buf)
         except OSError as exc:
-            print(f"[ERR] UDP TX buffer set failed: {exc}", file=sys.stderr)
-
-    udp_broadcast_tx = args.udp_broadcast or _resolved_ipv4_needs_so_broadcast(args.udp_remote_host)
-    if udp_broadcast_tx:
+            LOGGER.error("UDP TX buffer set failed: %s", exc)
+    if args.udp_transport == "multicast":
         try:
-            udp_tx.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            _configure_multicast_tx(udp_tx, multicast_ifaddr)
         except OSError as exc:
-            print(f"[ERR] UDP SO_BROADCAST failed: {exc}", file=sys.stderr)
+            LOGGER.error("UDP multicast TX setup failed: %s", exc)
 
     if args.mode in ("udp2can", "bridge"):
         try:
+            if args.udp_transport == "multicast":
+                _configure_multicast_rx(udp_rx, args.udp_remote_host, multicast_ifaddr)
             udp_rx.bind(("0.0.0.0", args.udp_listen_port))
             if args.udp_rx_buf > 0:
                 try:
                     udp_rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, args.udp_rx_buf)
                 except OSError as exc:
-                    print(f"[ERR] UDP RX buffer set failed: {exc}", file=sys.stderr)
+                    LOGGER.error("UDP RX buffer set failed: %s", exc)
         except OSError as exc:
-            print(f"[ERR] UDP bind failed: {exc}", file=sys.stderr)
+            LOGGER.error("UDP bind/setup failed: %s", exc)
             can_sock.close()
             udp_tx.close()
             udp_rx.close()
@@ -328,12 +384,12 @@ def main() -> int:
         try:
             udp_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, args.udp_tx_buf)
         except OSError as exc:
-            print(f"[ERR] UDP TX buffer (bridge send sock) set failed: {exc}", file=sys.stderr)
-    if udp_broadcast_tx and args.mode == "bridge":
+            LOGGER.error("UDP TX buffer (bridge send sock) set failed: %s", exc)
+    if args.udp_transport == "multicast" and args.mode == "bridge":
         try:
-            udp_send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            _configure_multicast_tx(udp_send_sock, multicast_ifaddr)
         except OSError as exc:
-            print(f"[ERR] UDP SO_BROADCAST (bridge send sock) failed: {exc}", file=sys.stderr)
+            LOGGER.error("UDP multicast TX setup (bridge send sock) failed: %s", exc)
 
     remote = (args.udp_remote_host, args.udp_remote_port)
     peers_last_seen: dict[tuple[str, int], float] = {}
@@ -341,7 +397,7 @@ def main() -> int:
     peer_max = max(1, args.udp_max_peers)
 
     def _touch_peer(peer: tuple[str, int], *, now: float | None = None) -> None:
-        if not args.udp_auto_peers:
+        if args.udp_transport != "unicast" or not args.udp_auto_peers:
             return
         ts = time.monotonic() if now is None else now
         if peer in peers_last_seen:
@@ -352,38 +408,40 @@ def main() -> int:
             oldest = min(peers_last_seen.items(), key=lambda kv: kv[1])[0]
             oldest_idle = ts - peers_last_seen[oldest]
             peers_last_seen.pop(oldest, None)
-            print(
-                f"[PEER] evicted oldest {oldest[0]}:{oldest[1]} idle={oldest_idle:.1f}s "
-                f"(max_peers={peer_max})",
-                file=sys.stderr,
+            LOGGER.info(
+                "PEER evicted oldest %s:%s idle=%.1fs (max_peers=%s)",
+                oldest[0],
+                oldest[1],
+                oldest_idle,
+                peer_max,
             )
         peers_last_seen[peer] = ts
-        print(
-            f"[PEER] connected {peer[0]}:{peer[1]} active_peers={len(peers_last_seen)}",
-            file=sys.stderr,
-        )
+        LOGGER.info("PEER connected %s:%s active_peers=%s", peer[0], peer[1], len(peers_last_seen))
 
     def _gc_peers(*, now: float | None = None) -> None:
-        if not args.udp_auto_peers:
+        if args.udp_transport != "unicast" or not args.udp_auto_peers:
             return
         ts = time.monotonic() if now is None else now
         stale = [(p, ts - last) for p, last in peers_last_seen.items() if (ts - last) > peer_ttl]
         for p, idle in stale:
             peers_last_seen.pop(p, None)
             udp_seq_expected_by_peer.pop(p, None)
-            print(
-                f"[PEER] disconnected {p[0]}:{p[1]} idle={idle:.1f}s "
-                f"(ttl={peer_ttl:.1f}s) active_peers={len(peers_last_seen)}",
-                file=sys.stderr,
+            LOGGER.info(
+                "PEER disconnected %s:%s idle=%.1fs (ttl=%.1fs) active_peers=%s",
+                p[0],
+                p[1],
+                idle,
+                peer_ttl,
+                len(peers_last_seen),
             )
 
     def _build_udp_targets() -> list[tuple[str, int]]:
-        if not args.udp_auto_peers:
+        if args.udp_transport == "multicast" or not args.udp_auto_peers:
             return [remote]
         targets = [remote]
         targets.extend(peer for peer in peers_last_seen.keys() if peer != remote)
         return targets
-    if args.mode == "bridge" and not args.allow_self_loop and not udp_broadcast_tx:
+    if args.mode == "bridge" and args.udp_transport == "unicast" and not args.allow_self_loop:
         local_hosts = {"127.0.0.1", "localhost", "0.0.0.0"}
         try:
             local_hosts.add(socket.gethostbyname(socket.gethostname()))
@@ -394,11 +452,9 @@ def main() -> int:
         except OSError:
             remote_ip = args.udp_remote_host
         if remote_ip in local_hosts and args.udp_remote_port == args.udp_listen_port:
-            print(
-                "[ERR] Self-loop detected: udp-remote-host points to local host and "
-                "udp-remote-port equals udp-listen-port. "
-                "Use different host/port or pass --allow-self-loop intentionally.",
-                file=sys.stderr,
+            LOGGER.error(
+                "Self-loop detected: udp-remote-host points to local host and udp-remote-port "
+                "equals udp-listen-port. Use different host/port or pass --allow-self-loop intentionally."
             )
             can_sock.close()
             udp_tx.close()
@@ -406,15 +462,18 @@ def main() -> int:
             return 2
 
     can_w = max(1, args.bridge_can_weight)
-    print(
-        f"[INFO] Started mode={args.mode} can={args.can_iface} "
-        f"udp_remote={remote[0]}:{remote[1]} udp_listen={args.udp_listen_port} "
-        f"udp_auto_peers={args.udp_auto_peers} udp_peer_ttl_sec={peer_ttl} udp_max_peers={peer_max} "
-        f"udp_broadcast={udp_broadcast_tx} bridge_can_weight={can_w} "
-        f"bridge_order={args.bridge_order} drain_burst={args.drain_burst} "
-        f"udp_pending_max={args.udp_pending_max} can_pending_max={args.can_pending_max} "
-        f"udp_drop_out_of_order={args.udp_drop_out_of_order} "
-        f"select_timeout={args.select_timeout}s"
+    LOGGER.info(
+        "start mode=%s can=%s udp=%s remote=%s:%s listen=%s mcast_if=%s peers=%s order=%s burst=%s",
+        args.mode,
+        args.can_iface,
+        args.udp_transport,
+        remote[0],
+        remote[1],
+        args.udp_listen_port,
+        multicast_ifaddr if args.udp_transport == "multicast" else "-",
+        args.udp_auto_peers,
+        args.bridge_order,
+        args.drain_burst,
     )
 
     seq = 0
@@ -450,7 +509,7 @@ def main() -> int:
             except (BlockingIOError, OSError) as exc:
                 if _send_would_block(exc):
                     break
-                print(f"[ERR] UDP send failed: {exc}", file=sys.stderr)
+                LOGGER.error("UDP send failed: %s", exc)
                 pending_udp.popleft()
                 break
         udp_pending_peak = max(udp_pending_peak, len(pending_udp))
@@ -465,7 +524,7 @@ def main() -> int:
             except (BlockingIOError, OSError) as exc:
                 if _send_would_block(exc):
                     break
-                print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                LOGGER.error("CAN send failed: %s", exc)
                 pending_can.popleft()
                 break
         can_pending_peak = max(can_pending_peak, len(pending_can))
@@ -521,7 +580,7 @@ def main() -> int:
                     except BlockingIOError:
                         return False
                     except OSError as exc:
-                        print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
+                        LOGGER.error("UDP recv failed: %s", exc)
                         return False
                     udp_rx_frames += 1
                     ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
@@ -555,7 +614,7 @@ def main() -> int:
                             udp_progress += 1
                             can_pending_peak = max(can_pending_peak, len(pending_can))
                         else:
-                            print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                            LOGGER.error("CAN send failed: %s", exc)
                             can_tx_fail += 1
                     return True
 
@@ -568,7 +627,7 @@ def main() -> int:
                     except BlockingIOError:
                         return False
                     except OSError as exc:
-                        print(f"[ERR] CAN recv failed: {exc}", file=sys.stderr)
+                        LOGGER.error("CAN recv failed: %s", exc)
                         return False
                     if len(frame) != CAN_FRAME_STRUCT.size:
                         dropped_can_wrong_len += 1
@@ -588,7 +647,7 @@ def main() -> int:
                                 pending_udp.append((payload, peer))
                                 udp_pending_peak = max(udp_pending_peak, len(pending_udp))
                                 continue
-                            print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
+                            LOGGER.error("UDP send failed to %s:%s: %s", peer[0], peer[1], exc)
                     can_progress += 1
                     return True
 
@@ -602,7 +661,7 @@ def main() -> int:
                         except BlockingIOError:
                             break
                         except OSError as exc:
-                            print(f"[ERR] CAN recv failed: {exc}", file=sys.stderr)
+                            LOGGER.error("CAN recv failed: %s", exc)
                             break
                         if len(frame) != CAN_FRAME_STRUCT.size:
                             dropped_can_wrong_len += 1
@@ -622,7 +681,7 @@ def main() -> int:
                                     pending_udp.append((payload, peer))
                                     udp_pending_peak = max(udp_pending_peak, len(pending_udp))
                                     continue
-                                print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
+                                LOGGER.error("UDP send failed to %s:%s: %s", peer[0], peer[1], exc)
                         can_progress += 1
 
                 def bridge_leg_udp_to_can() -> None:
@@ -636,7 +695,7 @@ def main() -> int:
                         except BlockingIOError:
                             break
                         except OSError as exc:
-                            print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
+                            LOGGER.error("UDP recv failed: %s", exc)
                             break
                         udp_rx_frames += 1
                         ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
@@ -670,7 +729,7 @@ def main() -> int:
                                 udp_progress += 1
                                 can_pending_peak = max(can_pending_peak, len(pending_can))
                                 break
-                            print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                            LOGGER.error("CAN send failed: %s", exc)
                             can_tx_fail += 1
 
                 if args.bridge_order == "interleaved":
@@ -698,7 +757,7 @@ def main() -> int:
                 except BlockingIOError:
                     break
                 except OSError as exc:
-                    print(f"[ERR] CAN recv failed: {exc}", file=sys.stderr)
+                    LOGGER.error("CAN recv failed: %s", exc)
                     break
                 if len(frame) != CAN_FRAME_STRUCT.size:
                     dropped_can_wrong_len += 1
@@ -718,7 +777,7 @@ def main() -> int:
                             pending_udp.append((payload, peer))
                             udp_pending_peak = max(udp_pending_peak, len(pending_udp))
                             continue
-                        print(f"[ERR] UDP send failed to {peer[0]}:{peer[1]}: {exc}", file=sys.stderr)
+                        LOGGER.error("UDP send failed to %s:%s: %s", peer[0], peer[1], exc)
 
         elif args.mode == "udp2can":
             while True:
@@ -729,7 +788,7 @@ def main() -> int:
                 except BlockingIOError:
                     break
                 except OSError as exc:
-                    print(f"[ERR] UDP recv failed: {exc}", file=sys.stderr)
+                    LOGGER.error("UDP recv failed: %s", exc)
                     break
                 udp_rx_frames += 1
                 ok, can_id_raw, dlc, data8, seq_rx = parse_udp_frame(payload)
@@ -761,24 +820,31 @@ def main() -> int:
                         pending_can.append(can_frame)
                         can_pending_peak = max(can_pending_peak, len(pending_can))
                         break
-                    print(f"[ERR] CAN send failed: {exc}", file=sys.stderr)
+                    LOGGER.error("CAN send failed: %s", exc)
                     can_tx_fail += 1
 
         now = time.monotonic()
         if now - last_stats >= args.stats_interval:
-            print(
-                f"tx_can2udp={tx_can2udp} udp_rx_frames={udp_rx_frames} "
-                f"rx_udp2can={rx_udp2can} can_tx_fail={can_tx_fail} "
-                f"dropped_bad_crc={dropped_bad_crc} dropped_can_wrong_len={dropped_can_wrong_len} "
-                f"udp_pending={len(pending_udp)} udp_pending_peak={udp_pending_peak} "
-                f"udp_pending_full={udp_pending_full} can_pending={len(pending_can)} "
-                f"can_pending_peak={can_pending_peak} can_pending_full={can_pending_full} "
-                f"udp_seq_gap_frames={udp_seq_gap_frames} udp_seq_out_of_order={udp_seq_out_of_order} "
-                f"udp_seq_dropped_ooo={udp_seq_dropped_ooo} active_udp_peers={len(peers_last_seen)}"
+            LOGGER.info(
+                "stats can2udp=%s udp2can=%s udp_rx=%s peers=%s q_udp=%s/%s q_can=%s/%s "
+                "drop_crc=%s drop_len=%s seq_gap=%s seq_ooo=%s can_fail=%s",
+                tx_can2udp,
+                rx_udp2can,
+                udp_rx_frames,
+                len(peers_last_seen),
+                len(pending_udp),
+                udp_pending_peak,
+                len(pending_can),
+                can_pending_peak,
+                dropped_bad_crc,
+                dropped_can_wrong_len,
+                udp_seq_gap_frames,
+                udp_seq_out_of_order,
+                can_tx_fail,
             )
             last_stats = now
 
-    print("[INFO] Stopping...")
+    LOGGER.info("Stopping...")
     can_sock.close()
     if udp_send_sock is udp_rx:
         udp_rx.close()

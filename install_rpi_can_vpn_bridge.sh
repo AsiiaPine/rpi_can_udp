@@ -52,6 +52,14 @@ slcan_speed_code_for_bitrate() {
   esac
 }
 
+is_ipv4_multicast() {
+  local ip="$1"
+  local first=""
+  [[ "${ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  first="${BASH_REMATCH[1]}"
+  (( first >= 224 && first <= 239 ))
+}
+
 UDEV_RULE_FILE="/etc/udev/rules.d/99-rpi-slcan.rules"
 
 print_help() {
@@ -95,9 +103,11 @@ Recognized keys in --config (optional unless noted):
   MODE              Bridge mode: bridge | can2udp | udp2can
   UDP_REMOTE_HOST   Remote UDP host
   UDP_REMOTE_PORT   Remote UDP port
+  UDP_TRANSPORT     unicast | multicast (default: unicast)
+  UDP_MULTICAST_IFACE  Multicast interface name, e.g. wg0 (optional)
+  UDP_MULTICAST_IFADDR Multicast local IPv4 address; overrides interface (optional)
   UDP_LISTEN_PORT   Local UDP listen port
   STATS_INTERVAL    Stats print interval (seconds)
-  UDP_BROADCAST     1 to enable --udp-broadcast
   UDP_PENDING_MAX   Max queued CAN->UDP datagrams if UDP send would block (default: 65536)
   CAN_PENDING_MAX   Max queued UDP->CAN frames if CAN send would block (default: 65536; matters for slcan)
   UDP_AUTO_PEERS    1 enables auto peer registration from inbound UDP (default: 1)
@@ -501,11 +511,13 @@ migrate_old_can_iface_service() {
 write_bridge_env() {
   local env_file="/etc/default/rpi-can-udp-bridge"
   : "${MODE:=bridge}"
+  : "${UDP_TRANSPORT:=unicast}"
   : "${UDP_REMOTE_HOST:=127.0.0.1}"
   : "${UDP_REMOTE_PORT:=5000}"
+  : "${UDP_MULTICAST_IFACE:=}"
+  : "${UDP_MULTICAST_IFADDR:=}"
   : "${UDP_LISTEN_PORT:=5000}"
   : "${STATS_INTERVAL:=2.0}"
-  : "${UDP_BROADCAST:=0}"
   : "${UDP_PENDING_MAX:=65536}"
   : "${CAN_PENDING_MAX:=65536}"
   : "${UDP_AUTO_PEERS:=1}"
@@ -516,11 +528,32 @@ write_bridge_env() {
   : "${BRIDGE_CAN_WEIGHT:=1}"
   : "${SELECT_TIMEOUT:=0.001}"
   : "${UDP_DROP_OUT_OF_ORDER:=0}"
-  local udp_broadcast_arg=""
   local udp_drop_ooo_arg=""
   local udp_auto_peers_arg="--udp-auto-peers"
-  if [[ "${UDP_BROADCAST}" == "1" ]]; then
-    udp_broadcast_arg="--udp-broadcast"
+  case "${UDP_TRANSPORT}" in
+    unicast|multicast) ;;
+    *)
+      err "Invalid UDP_TRANSPORT=${UDP_TRANSPORT}; use unicast or multicast"
+      exit 1
+      ;;
+  esac
+  if [[ "${UDP_TRANSPORT}" == "multicast" ]] && ! is_ipv4_multicast "${UDP_REMOTE_HOST}"; then
+    err "UDP_TRANSPORT=multicast requires UDP_REMOTE_HOST to be 224.0.0.0..239.255.255.255"
+    err "Current UDP_REMOTE_HOST=${UDP_REMOTE_HOST}. Use UDP_TRANSPORT=unicast for a peer IP."
+    exit 1
+  fi
+  if [[ "${UDP_TRANSPORT}" == "unicast" ]] && is_ipv4_multicast "${UDP_REMOTE_HOST}"; then
+    err "UDP_REMOTE_HOST=${UDP_REMOTE_HOST} is multicast, but UDP_TRANSPORT=unicast"
+    err "Use UDP_TRANSPORT=multicast for multicast groups."
+    exit 1
+  fi
+  if [[ "${UDP_TRANSPORT}" == "multicast" ]]; then
+    if [[ "${UDP_REMOTE_PORT}" != "${UDP_LISTEN_PORT}" ]]; then
+      err "UDP_TRANSPORT=multicast requires UDP_REMOTE_PORT and UDP_LISTEN_PORT to match"
+      err "Current UDP_REMOTE_PORT=${UDP_REMOTE_PORT}, UDP_LISTEN_PORT=${UDP_LISTEN_PORT}"
+      exit 1
+    fi
+    UDP_AUTO_PEERS=0
   fi
   if [[ "${UDP_DROP_OUT_OF_ORDER}" == "1" ]]; then
     udp_drop_ooo_arg="--udp-drop-out-of-order"
@@ -532,11 +565,13 @@ write_bridge_env() {
 # py_can_udp_bridge.py — CAN_IFACE is written by rpi-can-pick-iface.sh to:
 #   /run/rpi-can-udp-bridge-can.env
 MODE=${MODE}
+UDP_TRANSPORT=${UDP_TRANSPORT}
 UDP_REMOTE_HOST=${UDP_REMOTE_HOST}
 UDP_REMOTE_PORT=${UDP_REMOTE_PORT}
+UDP_MULTICAST_IFACE=${UDP_MULTICAST_IFACE}
+UDP_MULTICAST_IFADDR=${UDP_MULTICAST_IFADDR}
 UDP_LISTEN_PORT=${UDP_LISTEN_PORT}
 STATS_INTERVAL=${STATS_INTERVAL}
-UDP_BROADCAST=${UDP_BROADCAST}
 UDP_PENDING_MAX=${UDP_PENDING_MAX}
 CAN_PENDING_MAX=${CAN_PENDING_MAX}
 UDP_AUTO_PEERS=${UDP_AUTO_PEERS}
@@ -547,7 +582,6 @@ DRAIN_BURST=${DRAIN_BURST}
 BRIDGE_CAN_WEIGHT=${BRIDGE_CAN_WEIGHT}
 SELECT_TIMEOUT=${SELECT_TIMEOUT}
 UDP_DROP_OUT_OF_ORDER=${UDP_DROP_OUT_OF_ORDER}
-UDP_BROADCAST_ARG=${udp_broadcast_arg}
 UDP_DROP_OUT_OF_ORDER_ARG=${udp_drop_ooo_arg}
 UDP_AUTO_PEERS_ARG=${udp_auto_peers_arg}
 EOF
@@ -573,11 +607,13 @@ ExecStartPre=/usr/local/bin/rpi-can-pick-iface.sh
 ExecStart=/usr/bin/python3 -u ${BRIDGE_SCRIPT} \
   --mode \${MODE} \
   --can-iface \${CAN_IFACE} \
+  --udp-transport \${UDP_TRANSPORT} \
   --udp-remote-host \${UDP_REMOTE_HOST} \
   --udp-remote-port \${UDP_REMOTE_PORT} \
+  --udp-multicast-iface=\${UDP_MULTICAST_IFACE} \
+  --udp-multicast-ifaddr=\${UDP_MULTICAST_IFADDR} \
   --udp-listen-port \${UDP_LISTEN_PORT} \
   --stats-interval \${STATS_INTERVAL} \
-  \${UDP_BROADCAST_ARG} \
   \${UDP_AUTO_PEERS_ARG} \
   --udp-peer-ttl-sec \${UDP_PEER_TTL_SEC} \
   --udp-max-peers \${UDP_MAX_PEERS} \

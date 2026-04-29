@@ -57,9 +57,6 @@ sudo ./install_rpi_can_vpn_bridge.sh --config ./my-install.conf
 > [!NOTE] 
 > Don't forget to change UDP_REMOTE_HOST and ports for your connection.
 
-> [!NOTE] 
-> For broadcast the ip address should be x.x.x.255!
-
 ### `py_can_udp_bridge.py`
 
 Runtime bridge between SocketCAN and UDP.
@@ -73,16 +70,16 @@ Modes:
 Parameters:
 
 - `--can-iface` (e.g. `can0`, `slcan0`)
+- `--udp-transport` (`unicast` or `multicast`)
 - `--udp-remote-host`, `--udp-remote-port`
 - `--udp-listen-port`
-- `--udp-broadcast`
 - `--stats-interval`
 - `--allow-self-loop` (dangerous; disables local loop protection)
 
 Important:
 
 - UDP payload must match the expected bridge format (`UDP_FRAME_STRUCT`), otherwise frames are dropped (`dropped_bad_crc` grows).
-- For broadcast mode, use your subnet broadcast in `--udp-remote-host` (for example `192.168.1.255`), not `127.0.0.1`.
+- For multicast mode, use an IPv4 multicast group in `--udp-remote-host` (for example `239.42.0.1`).
 
 ### Transport Modes
 
@@ -90,7 +87,6 @@ Use one of these transport modes in `/etc/default/rpi-can-udp-bridge` (or in `in
 
 - `Unicast 1:1`: strict one remote endpoint.
 - `Unicast Multi-Client`: unicast fan-out with auto-registered peers.
-- `Broadcast`: easiest discovery in one L2 subnet, but usually higher packet loss.
 - `Multicast`: one sender to many listeners via group address (`239.x.x.x`).
 
 Recommended settings by mode:
@@ -98,34 +94,29 @@ Recommended settings by mode:
 1) Unicast 1:1:
 
 ```bash
+UDP_TRANSPORT=unicast
 UDP_REMOTE_HOST=192.168.1.10
-UDP_BROADCAST=0
 UDP_AUTO_PEERS=0
 ```
 
 2) Unicast Multi-Client (trusted subnet):
 
 ```bash
+UDP_TRANSPORT=unicast
 UDP_REMOTE_HOST=192.168.1.10  # fallback/default peer
-UDP_BROADCAST=0
 UDP_AUTO_PEERS=1
 UDP_PEER_TTL_SEC=30
 UDP_MAX_PEERS=64
 ```
 
-3) Broadcast:
+3) Multicast:
 
 ```bash
-UDP_REMOTE_HOST=192.168.1.255
-UDP_BROADCAST=1
-UDP_AUTO_PEERS=0
-```
-
-4) Multicast:
-
-```bash
+UDP_TRANSPORT=multicast
 UDP_REMOTE_HOST=239.42.0.1
-UDP_BROADCAST=0
+UDP_REMOTE_PORT=5000
+UDP_LISTEN_PORT=5000
+UDP_MULTICAST_IFACE=wg0
 UDP_AUTO_PEERS=0
 ```
 
@@ -133,6 +124,8 @@ Notes:
 
 - With `UDP_AUTO_PEERS=1`, peers are auto-registered from inbound UDP packets and CAN->UDP is fanned out to active peers (unicast fan-out).
 - In `Multicast`, keep `UDP_AUTO_PEERS=0` because fan-out is performed by multicast group delivery.
+- In `Multicast`, use the same `UDP_REMOTE_PORT` and `UDP_LISTEN_PORT` on every participant.
+- Over VPN, set `UDP_MULTICAST_IFACE` (e.g. `wg0`) or `UDP_MULTICAST_IFADDR` to the local VPN IP.
 - `UDP_DROP_OUT_OF_ORDER=1` can reduce corrupted multi-frame transfers on jittery links by dropping late UDP packets.
 - After changing `/etc/default/rpi-can-udp-bridge`, run:
 
